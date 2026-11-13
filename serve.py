@@ -27,7 +27,10 @@ Environment variables:
 import os
 
 os.environ.setdefault("XFORMERS_IGNORE_FLASH_VERSION_CHECK", "1")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# expandable_segments needs CUDA VMM APIs, which WSL2 (/dev/dxg) lacks; recent
+# torch then fails every allocation with "CUDA driver error: unknown error".
+if not os.path.exists("/dev/dxg"):
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import asyncio

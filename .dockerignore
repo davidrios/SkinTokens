@@ -1,19 +1,14 @@
-.git
-.gitignore
-.venv*
-__pycache__
-*.py[cod]
-*.egg-info
-.cache
-.idea
-.vscode
-tmp*
-results
-outputs
-dataset_clean
-dataset_inference*
-experiments
-*.ckpt
-*.glb
-*.fbx
-*.obj
+# Allowlist: exclude everything, then re-include runtime files only.
+*
+!serve.py
+!requirements.txt
+!configs/**
+!src/**
+# Model weights (checkpoints + Qwen3 tokenizer/config; no HF cache metadata)
+!experiments/**/*.ckpt
+!models/Qwen3-0.6B/*.json
+!models/Qwen3-0.6B/merges.txt
+!models/Qwen3-0.6B/LICENSE
+**/__pycache__
+**/*.py[cod]
+**/.cache

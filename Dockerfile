@@ -2,31 +2,16 @@ ARG BASE_IMAGE=torch-runtime:2.11.0-cu128-py3.11
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    PYTHONUNBUFFERED=1
 
-# Runtime system libs (GL/X11 libs for open3d/trimesh), plus gcc/libc6-dev,
-# which Triton needs to build its launcher stubs for torch.compile (inductor),
-# and curl for the compose healthcheck.
+# gcc/libc6-dev: Triton needs them to build launcher stubs for torch.compile
+# (inductor). curl: compose healthcheck.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     gcc \
-    git \
     libc6-dev \
-    libegl1 \
-    libfreetype6 \
-    libgl1 \
-    libglib2.0-0 \
     libgomp1 \
-    libsm6 \
-    libx11-6 \
-    libxext6 \
-    libxfixes3 \
-    libxi6 \
-    libxkbcommon0 \
-    libxrender1 \
-    libxxf86vm1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/requirements.txt
@@ -39,7 +24,16 @@ RUN pip list --format=freeze | grep -iE '^(torch|triton)==' > /tmp/constraints.t
     && rm /tmp/requirements.txt /tmp/constraints.txt
 
 WORKDIR /workspace/SkinTokens
-COPY . .
+# Model weights are baked in so the image is self-contained. They sit before the
+# code layers so code edits do not invalidate (or re-push) these large layers.
+# Layout matches src/paths.py defaults (MODEL_ROOT = project root).
+COPY experiments ./experiments
+COPY models ./models
+
+# Only what the server needs at runtime (see .dockerignore allowlist).
+COPY serve.py ./
+COPY configs ./configs
+COPY src ./src
 
 EXPOSE 8000
 

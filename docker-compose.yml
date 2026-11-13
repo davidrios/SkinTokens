@@ -12,9 +12,6 @@ services:
     environment:
       TZ: Asia/Shanghai
       NVIDIA_VISIBLE_DEVICES: all
-      SKINTOKENS_MODEL_ROOT: /models/SkinTokens
-      SKINTOKENS_EXPERIMENTS_DIR: /models/SkinTokens/experiments
-      SKINTOKENS_DATA_ROOT: /workspace/SkinTokens
       SKINTOKENS_DEVICE: cuda
       SKINTOKENS_HOST: 0.0.0.0
       SKINTOKENS_PORT: 8000
@@ -31,15 +28,6 @@ services:
       SKINTOKENS_INPUT_MAX_FACES: ${SKINTOKENS_INPUT_MAX_FACES:-1000000}
       SKINTOKENS_INPUT_MAX_MESH_INSTANCES: ${SKINTOKENS_INPUT_MAX_MESH_INSTANCES:-128}
       SKINTOKENS_INPUT_MAX_PRIMITIVES: ${SKINTOKENS_INPUT_MAX_PRIMITIVES:-256}
-      HF_HOME: /cache/huggingface
-      TORCH_HOME: /cache/torch
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
-      LIBGL_ALWAYS_SOFTWARE: "1"
-    volumes:
-      - .:/workspace/SkinTokens
-      - models:/models:ro
-      - hf_cache:/cache/huggingface
-      - torch_cache:/cache/torch
     working_dir: /workspace/SkinTokens
     ports:
       - "8087:8000"
@@ -60,13 +48,6 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-
-volumes:
-  hf_cache:
-  torch_cache:
-  models:
-    name: models
-    external: true
 
 networks:
   ai-shared:
