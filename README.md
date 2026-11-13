@@ -57,7 +57,7 @@ See the [project page](https://zjp-shadow.github.io/works/SkinTokens/) for the f
     ```sh
     uv venv --python 3.11
     source .venv/bin/activate
-    uv pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+    uv pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
     ```
 
     > [!NOTE]
@@ -68,10 +68,14 @@ See the [project page](https://zjp-shadow.github.io/works/SkinTokens/) for the f
     uv pip install -r requirements.txt
     ```
 
-4. Install [flash-attn](https://github.com/Dao-AILab/flash-attention):
+4. (Optional) Install [flash-attn](https://github.com/Dao-AILab/flash-attention):
     ```sh
     uv pip install flash-attn --no-build-isolation
     ```
+
+    > [!NOTE]
+    > flash-attn is optional. Without it, the LLM and VAE use PyTorch SDPA
+    > (auto-detected). Force a backend with `SKINTOKENS_ATTN_IMPL=sdpa|eager|flash_attention_2`.
 
 5. Download pretrained models:
     ```sh
@@ -129,18 +133,13 @@ from the external `models` volume at `/models/SkinTokens/experiments`.
 # Copy local experiments/ checkpoints into the shared Docker volume (once)
 .\scripts\copy_weights_to_volume.ps1
 
-# Build and start the Gradio service
+# Build and start the service
 docker compose build
 docker compose up -d
 ```
 
-If that CUDA base is already available under another local image tag, it can be
-reused without changing the resulting isolated Python environment:
-
-```powershell
-$env:SKINTOKENS_BASE_IMAGE = "trellis2:base"
-docker compose build
-```
+The image is based on `torch-runtime:2.11.0-cu128-py3.11` (PyTorch 2.11 + CUDA
+12.8 + Triton preinstalled). Override it with `$env:SKINTOKENS_BASE_IMAGE`.
 
 Open `http://127.0.0.1:8087`. To run command-line inference inside the same
 environment:

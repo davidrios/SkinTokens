@@ -9,6 +9,7 @@ import torch
 
 from ..rig_package.info.asset import Asset
 from ..model.tokenrig import TokenRig
+from ..model.attention import LLM_ATTN_IMPL
 
 @dataclass
 class TensorPacket:
@@ -71,7 +72,7 @@ def get_model(
         a = AutoModel.from_pretrained(
             hf_path,
             local_files_only=True,
-            _attn_implementation="flash_attention_2",
+            _attn_implementation=LLM_ATTN_IMPL,
             dtype=torch.bfloat16,
         )
         model.transformer.model.load_state_dict(a.state_dict())

@@ -36,17 +36,7 @@ LLM_LOCAL_DIR = resolve_model_path("models/Qwen3-0.6B")
 # keep peak VRAM in check; override via SKINTOKENS_DECODE_JOINT_BATCH.
 DECODE_JOINT_BATCH = max(1, int(os.environ.get("SKINTOKENS_DECODE_JOINT_BATCH", "8")))
 
-try:
-    from flash_attn_interface import flash_attn_func # type: ignore
-except Exception:
-    try:
-        from flash_attn.flash_attn_interface import flash_attn_func as _flash_attn_func
-        def flash_attn_func(*args, **kwargs):
-            res = _flash_attn_func(*args, **kwargs)
-            return res, None
-    except Exception:
-        def flash_attn_func(q, k, v, *args, **kwargs):
-            return torch.nn.functional.scaled_dot_product_attention(q, k, v), None
+from .attention import LLM_ATTN_IMPL
 
 class VocabSwitchingLogitsProcessor(LogitsProcessor):
     def __init__(self, tokenizer: Tokenizer, switch_token_id, eos_token_id, tokens_per_skin, init):
@@ -266,7 +256,7 @@ class TokenRig(ModelSpec):
         )
         with torch.device(llm_init_device):
             self.transformer = AutoModelForCausalLM.from_config(
-                config=llm_config, attn_implementation="flash_attention_2"
+                config=llm_config, attn_implementation=LLM_ATTN_IMPL
             )
         # Silence "not valid generation flags" warnings for sampling params
         # that are passed via **kwargs but missing from the auto-generated config.

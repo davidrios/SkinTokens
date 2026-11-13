@@ -142,8 +142,7 @@ FAST_DECODE_BACKEND = os.environ.get(
     "SKINTOKENS_FAST_DECODE_BACKEND", "cudagraphs"
 ).strip().lower()
 
-_FLASH_ATTN_IMPL = "flash_attention_2"
-_SDPA_ATTN_IMPL = "sdpa"
+from src.model.attention import LLM_ATTN_IMPL as _DEFAULT_ATTN_IMPL, SDPA_ATTN_IMPL as _SDPA_ATTN_IMPL
 # Built lazily so a transformers build without CompileConfig disables fast decode
 # gracefully rather than failing at import time.
 _fast_decode_compile_config = None
@@ -787,7 +786,7 @@ def _run_inference(
     elif FAST_DECODE:
         # A previous fast request may have switched the shared model to SDPA;
         # restore flash-attention for the original path.
-        _set_llm_attention(state.model, _FLASH_ATTN_IMPL)
+        _set_llm_attention(state.model, _DEFAULT_ATTN_IMPL)
 
     batch["generate_kwargs"] = generate_kwargs
 

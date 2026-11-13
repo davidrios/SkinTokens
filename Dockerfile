@@ -1,17 +1,19 @@
-ARG BASE_IMAGE=base-cuda:cu128-torch2.7.1
+ARG BASE_IMAGE=torch-runtime:2.11.0-cu128-py3.11
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    CUDA_HOME=/usr/local/cuda \
-    MAX_JOBS=4 \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# Install runtime system libs for Blender (bpy) headless operation.
+# Runtime system libs (GL/X11 libs for open3d/trimesh), plus gcc/libc6-dev,
+# which Triton needs to build its launcher stubs for torch.compile (inductor),
+# and curl for the compose healthcheck.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    gcc \
     git \
+    libc6-dev \
     libegl1 \
     libfreetype6 \
     libgl1 \
@@ -29,15 +31,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY requirements.txt /tmp/requirements.txt
 
-# PyTorch & flash-attn are pre-installed in base-cuda image (system python).
-# Install remaining packages directly into system python.
-RUN pip install --no-cache-dir -r /tmp/requirements.txt \
-    && rm /tmp/requirements.txt
-
+# PyTorch (CUDA 12.8) and Triton come from the base image. Pin them with a
+# constraints file so no dependency can swap in a different torch build.
+# flash-attn is optional: without it the code falls back to PyTorch SDPA.
+RUN pip list --format=freeze | grep -iE '^(torch|triton)==' > /tmp/constraints.txt \
+    && pip install --no-cache-dir -r /tmp/requirements.txt -c /tmp/constraints.txt \
+    && rm /tmp/requirements.txt /tmp/constraints.txt
 
 WORKDIR /workspace/SkinTokens
 COPY . .
 
-EXPOSE 8087
+EXPOSE 8000
 
 CMD ["python", "serve.py"]
