@@ -1,8 +1,10 @@
 import argparse
 import os
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import torch
 from torch import Tensor
 from tqdm import tqdm
 
@@ -110,6 +112,11 @@ def run_rig(
 
     results_out = []
 
+    def synchronize_inference_device():
+        device = model.device
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize(device)
+
     for i, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
         batch = {
             k: v.to(model.device, non_blocking=True) if isinstance(v, Tensor) else v
@@ -137,11 +144,19 @@ def run_rig(
         else:
             skeleton_tokens = None
 
+        # Synchronize around the timed section so CUDA work launched
+        # asynchronously is included in the measured inference duration.
+        # Batch loading/GLB parsing and GLB export both happen outside it.
+        synchronize_inference_device()
+        inference_started_at = time.perf_counter()
         preds: List[TokenRigResult] = model.predict_step(
             batch,
             skeleton_tokens=[skeleton_tokens] if skeleton_tokens is not None else None,
             make_asset=True,
         )["results"]
+        synchronize_inference_device()
+        inference_elapsed = time.perf_counter() - inference_started_at
+        print(f"[PROFILE] Inference for {filepaths[i].name}: {inference_elapsed:.3f}s")
 
         asset = preds[0].asset
         assert asset is not None
