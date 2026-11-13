@@ -1,11 +1,11 @@
 """Concurrency / parallelism tests for the staged serve pipeline.
 
 Covered guarantees:
-  * bpy stages (parse + export) never run concurrently  -> no Blender scene
+  * I/O stages (parse + export) never run concurrently  -> no shared I/O state
     pollution.
   * GPU inference is a single-instance critical section  -> one forward at a
     time.
-  * bpy and GPU stages of *different* requests overlap   -> real pipelining.
+  * I/O and GPU stages of *different* requests overlap   -> real pipelining.
   * results never cross-contaminate between concurrent requests.
   * cancellation unwinds cleanly (locks released, no leaked jobs).
 """
@@ -29,13 +29,13 @@ def install_fake_stages(monkeypatch, tracker, *, stage_sleep=0.05):
     """
 
     def fake_prepare(input_path, params, request_id, cancellation, progress_callback=None):
-        tracker.enter("bpy", request_id)
+        tracker.enter("io", request_id)
         try:
             time.sleep(stage_sleep)
             cancellation.raise_if_cancelled()
             return {"req": request_id, "num_samples": params.num_samples}
         finally:
-            tracker.exit("bpy", request_id)
+            tracker.exit("io", request_id)
 
     def fake_infer(batch, params, request_id, cancellation, progress_callback=None):
         tracker.enter("gpu", request_id)
@@ -47,13 +47,13 @@ def install_fake_stages(monkeypatch, tracker, *, stage_sleep=0.05):
             tracker.exit("gpu", request_id)
 
     def fake_export(preds, params, request_id, cancellation, progress_callback, tmp_output_dir):
-        tracker.enter("bpy", request_id)
+        tracker.enter("io", request_id)
         try:
             time.sleep(stage_sleep)
             cancellation.raise_if_cancelled()
             return [f"glb:{request_id}:{i}".encode() for i in range(len(preds))]
         finally:
-            tracker.exit("bpy", request_id)
+            tracker.exit("io", request_id)
 
     monkeypatch.setattr(serve, "_prepare_inputs", fake_prepare)
     monkeypatch.setattr(serve, "_run_inference", fake_infer)
@@ -67,7 +67,7 @@ def make_params(**kw):
 # --------------------------------------------------------------------------- #
 # Pipeline: serialization, pipelining, no cross-contamination
 # --------------------------------------------------------------------------- #
-def test_bpy_and_gpu_serialized_and_pipelined(monkeypatch, tracker):
+def test_io_and_gpu_serialized_and_pipelined(monkeypatch, tracker):
     install_fake_stages(monkeypatch, tracker)
 
     async def scenario():
@@ -81,10 +81,10 @@ def test_bpy_and_gpu_serialized_and_pipelined(monkeypatch, tracker):
     results = asyncio.run(scenario())
 
     # Safety: each resource is a single-instance critical section.
-    assert tracker.max_active["bpy"] == 1, "two bpy stages ran concurrently"
+    assert tracker.max_active["io"] == 1, "two I/O stages ran concurrently"
     assert tracker.max_active["gpu"] == 1, "two GPU inferences ran concurrently"
-    # Throughput: bpy of one request overlapped GPU of another.
-    assert tracker.overlap_bpy_gpu, "no bpy/GPU pipelining observed"
+    # Throughput: I/O of one request overlapped GPU of another.
+    assert tracker.overlap_io_gpu, "no I/O/GPU pipelining observed"
 
     # No cross-contamination: every glb belongs to its own request.
     assert len(results) == 4
@@ -156,7 +156,7 @@ def test_cancellation_unwinds_pipeline_and_releases_locks(monkeypatch, tracker):
     asyncio.run(scenario())
 
     assert serve.state.active_jobs == 0
-    assert not serve.state.bpy_lock.locked()
+    assert not serve.state.io_lock.locked()
     assert not serve.state.gpu_lock.locked()
 
 
@@ -201,7 +201,7 @@ def test_seeded_rng_does_not_perturb_surrounding_torch_stream():
 
 
 def test_seeded_rng_leaves_numpy_untouched():
-    """Seed is scoped to torch only; numpy belongs to the (serialized) bpy stage."""
+    """Seed is scoped to torch only; numpy belongs to the (serialized) I/O stage."""
     import numpy as np
 
     np.random.seed(7)

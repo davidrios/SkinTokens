@@ -89,6 +89,7 @@ tmp_vae/
 tmp_video/
 tmp_gradio/
 feature_viz/
+outputs/
 
 # Test / coverage
 htmlcov/

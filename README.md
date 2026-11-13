@@ -113,15 +113,14 @@ Then open `http://127.0.0.1:1024` in your browser.
 # Rig a single model
 python demo.py --input examples/giraffe.glb --output results/giraffe.glb
 
-# Skin a model using its existing skeleton
-python demo.py --input examples/giraffe_skeleton.glb --output results/giraffe.glb --use_skeleton
-
 # Batch process a directory (output defaults to outputs/{input_name}_bind.glb)
 python demo.py --input examples/
 
 # Process directory with custom output directory
 python demo.py --input examples/ --output results/
 ```
+
+Inputs may be `.glb`, `.gltf` (with embedded or adjacent resources) or `.obj`; any existing skin/skeleton in the input is ignored, and results are always a skinned-mesh-only `.glb` (materials and textures are not exported). Only triangle geometry is processed (triangle strips/fans are triangulated); points and lines are ignored, and files without triangles are rejected. Geometry I/O is native Python/NumPy (`src/rig_package/glb_io`) — Blender (`bpy`) is not required, and FBX is not supported (convert FBX to GLB first). Draco/meshopt-compressed GLBs and the `EXT_mesh_gpu_instancing` extension are not supported; expand instances before importing.
 
 ### Docker (NVIDIA GPU)
 
@@ -186,12 +185,10 @@ single-worker dataloading.
 | `--temperature` | 0.1 | Sampling temperature |
 | `--repetition_penalty` | 1.0 | Repetition penalty |
 | `--num_beams` | 5 | Number of beams for beam search |
-| `--use_skeleton` | False | Use existing skeleton (generate skin only) |
 
 ### Troubleshooting
 
 - **Server fails to start**: Make sure `http_proxy` / `https_proxy` environment variables are unset or correctly configured.
-- **Blender export issues**: Remove the `glTF_not_exported` node when importing results into Blender.
 
 ## 🙏 Acknowledgements
 

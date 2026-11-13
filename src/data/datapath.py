@@ -23,11 +23,28 @@ class LazyAsset(ABC):
         raise NotImplementedError()
 
 @dataclass
-class BpyLazyAsset(LazyAsset):
+class GlbLazyAsset(LazyAsset):
+    """Load .glb/.gltf/.obj natively (no bpy)."""
     
     def load(self) -> 'Asset':
-        from ..rig_package.parser.bpy import BpyParser
-        asset = BpyParser.load(filepath=self.path)
+        from ..rig_package.parser.glb import GlbParser
+        asset = GlbParser.load(filepath=self.path)
+        asset.cls = self.cls
+        asset.path = self.path
+        return asset
+
+@dataclass
+class UntrustedGlbLazyAsset(LazyAsset):
+    """Load an uploaded .glb/.gltf/.obj with resource limits and no external files.
+
+    Limits come from ``SKINTOKENS_MAX_UPLOAD_MB`` and ``SKINTOKENS_INPUT_*`` (see
+    ``rig_package/glb_io/limits.py``).
+    """
+
+    def load(self) -> 'Asset':
+        from ..rig_package.glb_io import InputLimits
+        from ..rig_package.parser.glb import GlbParser
+        asset = GlbParser.load(filepath=self.path, limits=InputLimits.from_env())
         asset.cls = self.cls
         asset.path = self.path
         return asset
@@ -123,8 +140,8 @@ class Datapath(ConfigSpec):
     # weight
     cls_weight: Optional[List[float]]=None
     
-    # use bpy loader
-    loader: type[LazyAsset]=BpyLazyAsset
+    # native glb/gltf/obj loader
+    loader: type[LazyAsset]=GlbLazyAsset
     
     # data name
     data_name: Optional[str]=None
@@ -148,8 +165,9 @@ class Datapath(ConfigSpec):
     @classmethod
     def parse(cls, **kwargs) -> 'Datapath':
         MAP = {
-            None: BpyLazyAsset,
-            'bpy': BpyLazyAsset,
+            None: GlbLazyAsset,
+            'glb': GlbLazyAsset,
+            'glb_untrusted': UntrustedGlbLazyAsset,
             'npz': NpzLazyAsset,
             'unirig': UniRigLazyAsset,
         }

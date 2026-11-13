@@ -2,7 +2,7 @@
 SkinTokens / TokenRig inference server — FastAPI persistent service.
 
 The model pipeline is loaded once at startup and kept resident in VRAM.
-Clients submit a 3D file (OBJ/FBX/GLB) and receive a rigged GLB over WebSocket. Generations are serialized through a single-GPU work queue so the
+Clients submit a 3D file (GLB/GLTF/OBJ) and receive a rigged GLB over WebSocket. Generations are serialized through a single-GPU work queue so the
 server can accept many concurrent connections while running one job at a time.
 
 .. note::
@@ -36,7 +36,6 @@ import json
 import logging
 import numpy as np
 import random
-import sys
 import shutil
 import tempfile
 import threading
@@ -46,8 +45,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import (
     asynccontextmanager,
     contextmanager,
-    redirect_stderr,
-    redirect_stdout,
     suppress,
 )
 from pathlib import Path
@@ -70,6 +67,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from tqdm import tqdm
+from src.rig_package.glb_io.limits import upload_limit_mb
 
 logger.info("Startup progress: runtime dependencies imported elapsed=%.2fs",
             time.monotonic() - _runtime_import_started)
@@ -89,7 +87,7 @@ DEVICE = os.environ.get("SKINTOKENS_DEVICE", "cuda" if torch.cuda.is_available()
 STARTUP_HEARTBEAT_SEC = max(
     1.0, float(os.environ.get("SKINTOKENS_STARTUP_HEARTBEAT_SEC", "15"))
 )
-SUPPORTED_EXT = {".obj", ".fbx", ".glb"}
+SUPPORTED_EXT = {".obj", ".glb", ".gltf"}
 
 
 
@@ -122,6 +120,11 @@ def _env_flag(name: str, default: bool) -> bool:
 DEFAULT_NUM_BEAMS = _env_int("SKINTOKENS_DEFAULT_NUM_BEAMS", 1, 1, 8)
 DEFAULT_NUM_SAMPLES = _env_int("SKINTOKENS_DEFAULT_NUM_SAMPLES", 1, 1, 8)
 MAX_NEW_TOKENS = _env_int("SKINTOKENS_MAX_NEW_TOKENS", 2048, 128, 4096)
+# Uploads are untrusted: capped in size here and parsed with resource limits
+# (SKINTOKENS_INPUT_* env vars, see src/rig_package/glb_io/limits.py), never
+# allowed to reference files outside the upload itself.
+MAX_UPLOAD_MB = upload_limit_mb()
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 USE_GENERATION_CACHE = _env_flag("SKINTOKENS_USE_CACHE", True)
 EMPTY_CACHE_AFTER_INFERENCE = _env_flag(
     "SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE", True
@@ -213,37 +216,6 @@ def _run_startup_stage(label: str, operation):
     return result
 
 
-@contextmanager
-def _suppress_bpy_output():
-    """Silence Blender/bpy stdout, stderr, and addon logging during bpy calls."""
-    previous_disable = logging.root.manager.disable
-    redirected_fds: list[tuple[int, int | None]] = []
-
-    with open(os.devnull, "w", encoding="utf-8") as devnull:
-        try:
-            for fd, stream in ((1, sys.stdout), (2, sys.stderr)):
-                with suppress(Exception):
-                    stream.flush()
-                try:
-                    saved_fd = os.dup(fd)
-                except OSError:
-                    saved_fd = None
-                else:
-                    os.dup2(devnull.fileno(), fd)
-                redirected_fds.append((fd, saved_fd))
-
-            with redirect_stdout(devnull), redirect_stderr(devnull):
-                logging.disable(logging.CRITICAL)
-                yield
-        finally:
-            logging.disable(previous_disable)
-            for fd, saved_fd in reversed(redirected_fds):
-                if saved_fd is None:
-                    continue
-                os.dup2(saved_fd, fd)
-                os.close(saved_fd)
-
-
 # --------------------------------------------------------------------------- #
 # Queue-position accounting (live lock heartbeat)
 # --------------------------------------------------------------------------- #
@@ -270,23 +242,22 @@ class ServerState:
     model = None
     tokenizer = None
     transform = None
-    # bpy is a process-global Blender singleton and is NOT thread-safe: every
-    # geometry op shares one scene. All bpy work (parse + export) is pinned to a
-    # single dedicated thread and serialized by ``bpy_lock``.
-    bpy_executor: Optional[ThreadPoolExecutor] = None
-    # GPU inference does not touch bpy, so it runs on its own thread and is
+    # Geometry I/O (native GLB parse + export) is CPU/memory heavy for large
+    # meshes, so it runs on one dedicated thread, serialized by ``io_lock``.
+    io_executor: Optional[ThreadPoolExecutor] = None
+    # GPU inference does no geometry I/O, so it runs on its own thread and is
     # serialized independently by ``gpu_lock`` (single instance — one forward at
-    # a time to bound VRAM). Pipelining: request N's bpy export can overlap with
+    # a time to bound VRAM). Pipelining: request N's I/O export can overlap with
     # request N+1's GPU inference.
     gpu_executor: Optional[ThreadPoolExecutor] = None
     ready: bool = False
     loaded_at: float = 0.0
     active_jobs: int = 0
-    bpy_lock: asyncio.Lock = asyncio.Lock()
+    io_lock: asyncio.Lock = asyncio.Lock()
     gpu_lock: asyncio.Lock = asyncio.Lock()
     # Per-lock queue accounting so a waiting client gets a live "queue_ahead"
     # heartbeat instead of a silent stall (see _acquire_or_cancel).
-    bpy_queue: "_PhaseQueue" = _PhaseQueue()
+    io_queue: "_PhaseQueue" = _PhaseQueue()
     gpu_queue: "_PhaseQueue" = _PhaseQueue()
     @property
     def busy(self) -> bool:
@@ -465,18 +436,11 @@ class GenParams(BaseModel):
     num_beams: int = Field(default=DEFAULT_NUM_BEAMS, ge=1, le=8)
     num_samples: int = Field(default=DEFAULT_NUM_SAMPLES, ge=1, le=8)
     seed: int | None = None
-    use_skeleton: bool = False
 
 
 # --------------------------------------------------------------------------- #
 # Pipeline loading
 # --------------------------------------------------------------------------- #
-def _load_bpy_inproc():
-    """Import bpy-backed parser on the dedicated generation thread."""
-    with _suppress_bpy_output():
-        from src.rig_package.parser.bpy import BpyParser  # noqa: F401
-
-
 def _prewarm_fast_decode() -> None:
     """Trigger the fast-decode compile + CUDA-graph capture on a synthetic input.
 
@@ -544,29 +508,21 @@ def _prewarm_fast_decode() -> None:
 
 
 def _load_pipeline():
-    """Load the model pipeline and initialize the bpy runtime."""
+    """Load the model pipeline and start the stage executors."""
     from src.data.transform import Transform
     from src.tokenizer.parse import get_tokenizer
     from src.server.spec import get_model
 
-    if state.bpy_executor is None:
-        state.bpy_executor = ThreadPoolExecutor(
+    if state.io_executor is None:
+        state.io_executor = ThreadPoolExecutor(
             max_workers=1,
-            thread_name_prefix="skintokens-bpy",
+            thread_name_prefix="skintokens-io",
         )
     if state.gpu_executor is None:
         state.gpu_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="skintokens-gpu",
         )
-
-    def load_bpy_fn():
-        # bpy must be imported/initialized on the same thread that later runs
-        # all geometry ops, so it is pinned to the dedicated bpy executor.
-        assert state.bpy_executor is not None
-        state.bpy_executor.submit(_load_bpy_inproc).result()
-
-    _run_startup_stage("initializing geometry runtime", load_bpy_fn)
 
     def load_model_fn():
         model = get_model(MODEL_CKPT, hf_path=HF_PATH, device=DEVICE)
@@ -606,10 +562,10 @@ def _seeded_torch_rng(seed: int | None):
     HuggingFace ``generate`` samples from the *global* torch RNG (it accepts no
     per-call generator), so a request's seed has to be applied globally. Because
     the GPU stage is serialized by ``gpu_lock`` (one inference at a time) and no
-    other concurrent stage consumes torch RNG (bpy stages use ``np.random``),
+    other concurrent stage consumes torch RNG (I/O stages use ``np.random``),
     seeding here is race-free. Saving/restoring the state additionally prevents a
     seeded request from perturbing a later request's sampling. numpy/python RNG
-    is deliberately left untouched so it cannot collide with bpy stages running
+    is deliberately left untouched so it cannot collide with I/O stages running
     concurrently on another request.
     """
     if seed is None:
@@ -670,11 +626,10 @@ def _prepare_inputs(
     cancellation: CancellationToken,
     progress_callback=None,
 ):
-    """Stage 1 (bpy): parse the input file into a single model batch.
+    """Stage 1 (I/O): parse the input file into a single model batch.
 
-    Runs on the dedicated bpy thread under ``bpy_lock``. Returns CPU tensors plus
-    the parsed asset data; once returned the batch no longer depends on the live
-    Blender scene, so the bpy lock can be released before inference.
+    Runs on the dedicated I/O thread under ``io_lock``. Returns CPU tensors plus
+    the parsed asset data, so the I/O lock can be released before inference.
     """
     from src.data.dataset import DatasetConfig, RigDatasetModule
 
@@ -684,7 +639,7 @@ def _prepare_inputs(
 
     datapath = {
         "data_name": None,
-        "loader": "bpy",
+        "loader": "glb_untrusted",
         "filepaths": {"articulation": [str(input_path)]},
     }
 
@@ -704,16 +659,14 @@ def _prepare_inputs(
         process_fn=state.model._process_fn,
     )
 
-    with _suppress_bpy_output():
-        dataloader = module.predict_dataloader()["articulation"]
+    dataloader = module.predict_dataloader()["articulation"]
     cancellation.raise_if_cancelled()
 
     batch_iterator = iter(dataloader)
-    with _suppress_bpy_output():
-        try:
-            batch = next(batch_iterator)
-        except StopIteration:
-            batch = None
+    try:
+        batch = next(batch_iterator)
+    except StopIteration:
+        batch = None
 
     if batch is None:
         raise RuntimeError("No data in dataloader")
@@ -729,8 +682,8 @@ def _run_inference(
 ):
     """Stage 2 (GPU): run model sampling, returning a list of TokenRigResult.
 
-    Runs on the dedicated GPU thread under ``gpu_lock``. Does not touch bpy; the
-    produced assets are plain numpy, so export can later run on the bpy thread
+    Runs on the dedicated GPU thread under ``gpu_lock``. Does no geometry I/O; the
+    produced assets are plain numpy, so export can later run on the I/O thread
     while the next request's inference overlaps here.
     """
     from torch import Tensor
@@ -745,9 +698,9 @@ def _run_inference(
         for k, v in batch.items()
     }
 
-    if not params.use_skeleton:
-        batch.pop("skeleton_tokens", None)
-        batch.pop("skeleton_mask", None)
+    # Inputs are plain meshes: the model always generates skeleton + skin.
+    batch.pop("skeleton_tokens", None)
+    batch.pop("skeleton_mask", None)
 
     generate_kwargs = dict(
         max_new_tokens=MAX_NEW_TOKENS,
@@ -790,12 +743,6 @@ def _run_inference(
 
     batch["generate_kwargs"] = generate_kwargs
 
-    if "skeleton_tokens" in batch and "skeleton_mask" in batch:
-        mask = batch["skeleton_mask"][0] == 1
-        skeleton_tokens = batch["skeleton_tokens"][0][mask].cpu().numpy()
-    else:
-        skeleton_tokens = None
-
     cancellation.raise_if_cancelled()
     if progress_callback:
         progress_callback(10, "model sampling")
@@ -803,7 +750,6 @@ def _run_inference(
     with _seeded_torch_rng(params.seed), torch.inference_mode():
         preds: List[TokenRigResult] = state.model.predict_step(
             batch,
-            skeleton_tokens=[skeleton_tokens] if skeleton_tokens is not None else None,
             make_asset=True,
             progress_callback=progress_callback if progress_callback else None,
         )["results"]
@@ -836,11 +782,14 @@ def _export_samples(
     progress_callback,
     tmp_output_dir: "Path",
 ) -> list[bytes]:
-    """Stage 3 (bpy): export each predicted asset to a GLB on disk.
+    """Stage 3 (I/O): export each predicted asset to a GLB on disk.
 
-    Runs on the dedicated bpy thread under ``bpy_lock``.
+    Runs on the dedicated I/O thread under ``io_lock``.
     """
-    from src.rig_package.parser.bpy import transfer_rigging
+    from src.rig_package.glb_io import InputLimits
+    from src.rig_package.parser.glb import transfer_rigging
+
+    limits = InputLimits.from_env()
 
     sample_count = max(len(preds), 1)
     glbs: list[bytes] = []
@@ -851,32 +800,27 @@ def _export_samples(
 
         asset = pred.asset
         assert asset is not None
-        if not params.use_skeleton:
-            collapsed_joints = asset.collapse_near_parent_joints()
-            if collapsed_joints:
-                logger.info(
-                    "[%s] sample=%d collapsed near-parent skeleton joints: %s",
-                    request_id,
-                    sample_idx,
-                    ", ".join(collapsed_joints),
-                )
+        collapsed_joints = asset.collapse_near_parent_joints()
+        if collapsed_joints:
+            logger.info(
+                "[%s] sample=%d collapsed near-parent skeleton joints: %s",
+                request_id,
+                sample_idx,
+                ", ".join(collapsed_joints),
+            )
 
         sample_out_path = tmp_output_dir / f"sample_{sample_idx}.glb"
         sample_out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with _suppress_bpy_output():
-            transfer_rigging(
-                source_asset=asset,
-                target_path=asset.path,
-                export_path=str(sample_out_path),
-                group_per_vertex=4,
-                # auto_ground shifts the whole scene so its bottom sits at Z=0,
-                # which moves the skeleton root height. When a skeleton was
-                # supplied (use_skeleton), the output must sit exactly where the
-                # input skeleton was, so grounding is disabled and only skinning
-                # is applied.
-                auto_ground=not params.use_skeleton,
-            )
+        transfer_rigging(
+            source_asset=asset,
+            target_path=asset.path,
+            export_path=str(sample_out_path),
+            group_per_vertex=4,
+            # Shift the whole scene so its bottom sits at Z=0.
+            auto_ground=True,
+            limits=limits,
+        )
 
         glb_data = sample_out_path.read_bytes()
         cancellation.raise_if_cancelled()
@@ -944,38 +888,43 @@ async def _generate(
     cancellation = cancellation or CancellationToken()
     reporter = ProgressReporter(request_id, cancellation, progress_callback)
 
-    suffix = Path(filename).suffix.lower()
+    suffix = Path(str(filename)).suffix.lower()
     if suffix not in SUPPORTED_EXT:
         raise ValueError(
             f"Unsupported file format: {suffix}. Supported: {SUPPORTED_EXT}"
         )
+    if len(file_data) > MAX_UPLOAD_BYTES:
+        raise ValueError(f"Uploaded file is too large: {len(file_data)} bytes "
+                         f"(max {MAX_UPLOAD_MB} MB)")
 
-    bpy_queued = state.bpy_lock.locked()
+    io_queued = state.io_lock.locked()
     gpu_queued = state.gpu_lock.locked()
-    logger.info("[%s] queued bpy=%s gpu=%s filename=%r",
-                request_id, bpy_queued, gpu_queued, filename)
+    logger.info("[%s] queued io=%s gpu=%s filename=%r",
+                request_id, io_queued, gpu_queued, filename)
 
     tmp_input_dir = Path(tempfile.mkdtemp(prefix="skintokens_input_"))
     tmp_output_dir = Path(tempfile.mkdtemp(prefix="skintokens_output_"))
-    input_path = tmp_input_dir / filename
+    # Never use the client's filename as a path: it may contain separators,
+    # ``..`` or a drive and escape the temp directory. Only its suffix is used.
+    input_path = tmp_input_dir / f"input{suffix}"
     state.active_jobs += 1
     try:
         input_path.write_bytes(file_data)
         del file_data
         cancellation.raise_if_cancelled()
 
-        # --- Stage 1: parse input geometry (bpy, serialized) ---
+        # --- Stage 1: parse input geometry (I/O, serialized) ---
         wait_started = time.monotonic()
         async with _acquire_or_cancel(
-            state.bpy_lock, cancellation,
-            lock_name=f"[{request_id}] bpy_lock (parse)",
-            queue=state.bpy_queue, queue_callback=queue_callback,
-            queue_phase="bpy",
+            state.io_lock, cancellation,
+            lock_name=f"[{request_id}] io_lock (parse)",
+            queue=state.io_queue, queue_callback=queue_callback,
+            queue_phase="io",
         ):
-            logger.info("[%s] bpy lock acquired (parse) after %.2fs",
+            logger.info("[%s] io lock acquired (parse) after %.2fs",
                         request_id, time.monotonic() - wait_started)
             batch = await _to_thread_cancellable(
-                state.bpy_executor, _prepare_inputs,
+                state.io_executor, _prepare_inputs,
                 input_path, params, request_id, cancellation, reporter.report,
                 cancellation=cancellation,
             )
@@ -997,18 +946,18 @@ async def _generate(
             )
         del batch
 
-        # --- Stage 3: export each sample to GLB (bpy, serialized) ---
+        # --- Stage 3: export each sample to GLB (I/O, serialized) ---
         wait_started = time.monotonic()
         async with _acquire_or_cancel(
-            state.bpy_lock, cancellation,
-            lock_name=f"[{request_id}] bpy_lock (export)",
-            queue=state.bpy_queue, queue_callback=queue_callback,
-            queue_phase="bpy",
+            state.io_lock, cancellation,
+            lock_name=f"[{request_id}] io_lock (export)",
+            queue=state.io_queue, queue_callback=queue_callback,
+            queue_phase="io",
         ):
-            logger.info("[%s] bpy lock acquired (export) after %.2fs",
+            logger.info("[%s] io lock acquired (export) after %.2fs",
                         request_id, time.monotonic() - wait_started)
             glbs = await _to_thread_cancellable(
-                state.bpy_executor, _export_samples,
+                state.io_executor, _export_samples,
                 preds, params, request_id, cancellation, reporter.report,
                 tmp_output_dir,
                 cancellation=cancellation,
@@ -1065,9 +1014,9 @@ async def lifespan(app: FastAPI):
         state.tokenizer = None
         state.transform = None
         state.ready = False
-        if state.bpy_executor is not None:
-            state.bpy_executor.shutdown(wait=False, cancel_futures=True)
-            state.bpy_executor = None
+        if state.io_executor is not None:
+            state.io_executor.shutdown(wait=False, cancel_futures=True)
+            state.io_executor = None
         if state.gpu_executor is not None:
             state.gpu_executor.shutdown(wait=False, cancel_futures=True)
             state.gpu_executor = None
@@ -1087,9 +1036,9 @@ async def health():
         "busy": state.busy,
         "active_jobs": state.active_jobs,
         "gpu_busy": state.gpu_lock.locked(),
-        "bpy_busy": state.bpy_lock.locked(),
+        "io_busy": state.io_lock.locked(),
         "queue_depth": {
-            "bpy": max(0, state.bpy_queue.enqueued - state.bpy_queue.released),
+            "io": max(0, state.io_queue.enqueued - state.io_queue.released),
             "gpu": max(0, state.gpu_queue.enqueued - state.gpu_queue.released),
         },
     }
@@ -1125,6 +1074,13 @@ async def ws_generate(ws: WebSocket):
             return
 
         filename = req.pop("filename", "input.obj")
+        if req.get("use_skeleton"):
+            logger.warning("[%s] rejected: use_skeleton is no longer supported", request_id)
+            await ws.send_json({"stage": "error", "message":
+                                "use_skeleton is no longer supported; inputs are meshes and "
+                                "the skeleton is always generated"})
+            await ws.close()
+            return
 
         # Receive binary file data
         try:
@@ -1187,7 +1143,7 @@ async def ws_generate(ws: WebSocket):
             except Exception:
                 cancellation.cancel("WebSocket client disconnected")
 
-        queued = state.bpy_lock.locked() or state.gpu_lock.locked()
+        queued = state.io_lock.locked() or state.gpu_lock.locked()
         logger.info("[%s] queued=%s", request_id, queued)
         await ws.send_json({
             "stage": "queued", "queued": queued, "request_id": request_id
@@ -1309,7 +1265,7 @@ def main():
         for name, formatter in uvicorn.config.LOGGING_CONFIG["formatters"].items()
     }
     uvicorn.run(app, host=args.host, port=args.port, workers=1,
-                ws_max_size=64 * 1024 * 1024, log_config=log_config)
+                ws_max_size=MAX_UPLOAD_BYTES + 64 * 1024, log_config=log_config)
 
 
 if __name__ == "__main__":

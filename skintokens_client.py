@@ -2,7 +2,7 @@
 
 Example:
     python skintokens_client.py --input assets/character.obj --output out.glb
-    python skintokens_client.py --input model.fbx --server http://HOST:8087 --use-skeleton
+    python skintokens_client.py --input model.glb --server http://HOST:8087
 
 Requires the ``websockets`` package.
 """
@@ -87,7 +87,6 @@ async def _run(args) -> None:
         "num_samples": args.num_samples,
         "seed": args.seed,
         "do_sample": True,
-        "use_skeleton": args.use_skeleton,
     }
 
     progress = ProgressDisplay()
@@ -165,7 +164,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="SkinTokens / TokenRig WebSocket client with live progress"
     )
-    parser.add_argument("--input", required=True, help="Input 3D file path (OBJ/FBX/GLB)")
+    parser.add_argument("--input", required=True, help="Input 3D file path (GLB/GLTF/OBJ)")
     parser.add_argument(
         "--output",
         default=None,
@@ -181,7 +180,6 @@ def main() -> None:
     parser.add_argument("--num-samples", type=int, default=1, help="Number of parallel samples to generate (1-8, default: 1)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible generation")
 
-    parser.add_argument("--use-skeleton", action="store_true", help="Use skeleton for skin generation")
 
     parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
     args = parser.parse_args()

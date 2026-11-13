@@ -4,7 +4,6 @@ einops
 omegaconf
 scipy
 lightning
-bpy>=4.2
 trimesh
 open3d
 huggingface_hub

@@ -16,7 +16,7 @@ from src.model.tokenrig import TokenRigResult
 from src.tokenizer.parse import get_tokenizer
 from src.server.spec import get_model
 from src.paths import EXPERIMENTS_DIR
-from src.rig_package.parser.bpy import transfer_rigging
+from src.rig_package.parser.glb import transfer_rigging
 
 MODEL_CKPTS = [
     str(EXPERIMENTS_DIR / "articulation_xl_quantization_256_token_4/grpo_1400.ckpt"),
@@ -47,7 +47,7 @@ def load_model(model_ckpt: str, hf_path: Optional[str], device: Optional[str] = 
     return ("Model loaded.", model_ckpt)
 
 
-SUPPORTED_EXT = {".obj", ".fbx", ".glb"}
+SUPPORTED_EXT = {".obj", ".glb", ".gltf"}
 
 
 def collect_files(input_path: Path) -> List[Path]:
@@ -77,7 +77,6 @@ def run_rig(
     temperature: float,
     repetition_penalty: float,
     num_beams: int,
-    use_skeleton: bool,
     output_paths: List[Path],
     model_ckpt: str,
     hf_path: Optional[str],
@@ -88,7 +87,7 @@ def run_rig(
 
     datapath = {
         "data_name": None,
-        "loader": "bpy",
+        "loader": "glb",
         "filepaths": {"articulation": [str(p) for p in filepaths]},
     }
 
@@ -123,9 +122,9 @@ def run_rig(
             for k, v in batch.items()
         }
 
-        if not use_skeleton:
-            batch.pop("skeleton_tokens", None)
-            batch.pop("skeleton_mask", None)
+        # Inputs are plain meshes: the model always generates skeleton + skin.
+        batch.pop("skeleton_tokens", None)
+        batch.pop("skeleton_mask", None)
 
         batch["generate_kwargs"] = dict(
             max_new_tokens=2048,
@@ -138,12 +137,6 @@ def run_rig(
             do_sample=True,
         )
 
-        if "skeleton_tokens" in batch and "skeleton_mask" in batch:
-            mask = batch["skeleton_mask"][0] == 1
-            skeleton_tokens = batch["skeleton_tokens"][0][mask].cpu().numpy()
-        else:
-            skeleton_tokens = None
-
         # Synchronize around the timed section so CUDA work launched
         # asynchronously is included in the measured inference duration.
         # Batch loading/GLB parsing and GLB export both happen outside it.
@@ -151,7 +144,6 @@ def run_rig(
         inference_started_at = time.perf_counter()
         preds: List[TokenRigResult] = model.predict_step(
             batch,
-            skeleton_tokens=[skeleton_tokens] if skeleton_tokens is not None else None,
             make_asset=True,
         )["results"]
         synchronize_inference_device()
@@ -160,10 +152,9 @@ def run_rig(
 
         asset = preds[0].asset
         assert asset is not None
-        if not use_skeleton:
-            collapsed_joints = asset.collapse_near_parent_joints()
-            if collapsed_joints:
-                print(f"[postprocess] Collapsed near-parent joints: {', '.join(collapsed_joints)}")
+        collapsed_joints = asset.collapse_near_parent_joints()
+        if collapsed_joints:
+            print(f"[postprocess] Collapsed near-parent joints: {', '.join(collapsed_joints)}")
 
         out_path = output_paths[i]
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -209,7 +200,6 @@ def run_cli(args):
         args.temperature,
         args.repetition_penalty,
         args.num_beams,
-        args.use_skeleton,
         outputs,
         args.model_ckpt,
         args.hf_path,
@@ -227,7 +217,6 @@ if __name__ == "__main__":
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
     parser.add_argument("--num_beams", type=int, default=1)
 
-    parser.add_argument("--use_skeleton", action="store_true")
 
     parser.add_argument("--model_ckpt", default=MODEL_CKPTS[0] if MODEL_CKPTS else "")
     parser.add_argument("--hf_path", default=None)
