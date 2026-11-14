@@ -8,13 +8,12 @@ locks: the parallelism comes from running several workers.
 
 .. note::
 
-    Results are **non-deterministic** — the same input file may produce a
-    different skeleton (joint count / structure) across runs, even with identical
-    parameters (``do_sample=False``, same ``num_beams``).  This is inherent to
-    flash_attention_2 + bf16: the tiling algorithm introduces tiny floating-point
-    differences per forward pass, which accumulate over 28 transformer layers and
-    cause beam‑search tie‑breaking to diverge.  TF32 remains enabled for speed;
-    disabling it would reduce — but not eliminate — this effect.
+    Decoding is fixed to greedy single-beam search, so a request's only
+    randomness is where points are sampled on the mesh. Every stage runs under
+    seeds derived from the request's ``seed`` (:mod:`src.data.seeding`), so the
+    same input, ``seed`` and ``num_samples`` give the same GLBs on the same GPU
+    and software stack. Different GPUs or library versions may select different
+    kernels and so may round differently.
 """
 from __future__ import annotations
 
@@ -33,7 +32,6 @@ import shutil
 import tempfile
 import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
 
@@ -186,12 +184,6 @@ def _prewarm_fast_decode() -> None:
         "cls": ["prewarm"],
         "generate_kwargs": dict(
             max_new_tokens=config.MAX_NEW_TOKENS,
-            num_beams=1,
-            num_samples=1,
-            do_sample=True,
-            top_k=5,
-            top_p=0.95,
-            temperature=1.0,
             use_cache=config.USE_GENERATION_CACHE,
             only_ids=True,
             cache_implementation="static",
@@ -219,6 +211,10 @@ def load(options: Optional[dict] = None) -> dict:
     if threads:
         torch.set_num_threads(int(threads))
     decode_attention.register()
+    if config.DETERMINISTIC:
+        from src.data.seeding import enable_deterministic_kernels
+        enable_deterministic_kernels()
+    logger.info("deterministic kernels: %s", config.DETERMINISTIC)
     # generate() checks for its end one step late instead of syncing every token.
     from src.model.grammar import enable_cuda_deferred_stop
     logger.info("deferred stop check on CUDA: %s", enable_cuda_deferred_stop())
@@ -248,32 +244,6 @@ def load(options: Optional[dict] = None) -> dict:
 # --------------------------------------------------------------------------- #
 # Stages
 # --------------------------------------------------------------------------- #
-@contextmanager
-def seeded_torch_rng(seed: int | None):
-    """Scope a seed to torch/CUDA RNG only, restoring global state on exit.
-
-    HuggingFace ``generate`` samples from the *global* torch RNG (it accepts no
-    per-call generator), so a request's seed has to be applied globally. A
-    worker process runs one request at a time, so seeding here is race-free.
-    Saving/restoring the state additionally prevents a seeded request from
-    perturbing the next request's sampling. numpy/python RNG is left untouched.
-    """
-    if seed is None:
-        yield
-        return
-    cpu_state = torch.get_rng_state()
-    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    try:
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        yield
-    finally:
-        torch.set_rng_state(cpu_state)
-        if cuda_states is not None:
-            torch.cuda.set_rng_state_all(cuda_states)
-
-
 def _report_sample_progress(progress_callback, sample_count: int, sample_idx: int,
                             phase: str) -> None:
     """Map a per-sample export phase to a percentage in the 85–99 band."""
@@ -303,8 +273,11 @@ def _report_sample_progress(progress_callback, sample_count: int, sample_idx: in
 
 def prepare_inputs(input_path: Path, params: GenParams, request_id: str,
                    cancellation: Cancellation, progress_callback=None):
-    """Stage 1 (CPU): parse the input file into a single model batch."""
+    """Stage 1 (CPU): parse the input file into a single model batch holding
+    ``params.num_samples`` point clouds, cloud ``i`` sampled under
+    ``derive_seed(params.seed, i)``."""
     from src.data.dataset import DatasetConfig, RigDatasetModule
+    from src.data.seeding import sample_point_clouds, seeded_rng
 
     cancellation.raise_if_cancelled()
     if progress_callback:
@@ -333,16 +306,24 @@ def prepare_inputs(input_path: Path, params: GenParams, request_id: str,
     dataloader = module.predict_dataloader()["articulation"]
     cancellation.raise_if_cancelled()
 
-    batch = next(iter(dataloader), None)
+    with seeded_rng(params.seed):
+        batch = next(iter(dataloader), None)
     if batch is None:
         raise RuntimeError("No data in dataloader")
+    cancellation.raise_if_cancelled()
+    # The loader sampled one cloud; replace it with one per sample.
+    asset = batch["model_input"][0].asset
+    vertices, normals = sample_point_clouds(asset, state.transform.sampler,
+                                            params.seed, params.num_samples)
+    batch["vertices"], batch["normals"] = vertices.unsqueeze(0), normals.unsqueeze(0)
     return batch
 
 
 def run_inference(batch: dict, params: GenParams, request_id: str,
                   cancellation: Cancellation, progress_callback=None):
-    """Stage 2 (GPU): run model sampling, returning a list of TokenRigResult."""
+    """Stage 2 (GPU): decode one rig per point cloud, returning a list of TokenRigResult."""
     from torch import Tensor
+    from src.data.seeding import seeded_rng
     from src.model.tokenrig import TokenRigResult
 
     cancellation.raise_if_cancelled()
@@ -357,21 +338,13 @@ def run_inference(batch: dict, params: GenParams, request_id: str,
     batch.pop("skeleton_tokens", None)
     batch.pop("skeleton_mask", None)
 
+    # Decoding is greedy and single-beam (fixed in TokenRig.generate).
     generate_kwargs = dict(
         max_new_tokens=config.MAX_NEW_TOKENS,
-        top_k=params.top_k,
-        top_p=params.top_p,
-        temperature=params.temperature,
-        repetition_penalty=params.repetition_penalty,
-        num_beams=params.num_beams,
-        num_samples=params.num_samples,
-        do_sample=True,
         use_cache=config.USE_GENERATION_CACHE,
     )
 
-    # Fast decode requires single-beam search; beam requests fall back to the
-    # original flash-attention + dynamic-cache path.
-    fast_decode = config.FAST_DECODE and params.num_beams == 1
+    fast_decode = config.FAST_DECODE
     if fast_decode:
         try:
             compile_config = _get_fast_decode_compile_config()
@@ -385,8 +358,8 @@ def run_inference(batch: dict, params: GenParams, request_id: str,
         logger.info("[%s] fast decode enabled (%s attention + static cache + %s)",
                     request_id, decode_attention.DECODE_ATTN_MODE, config.FAST_DECODE_BACKEND)
     elif config.FAST_DECODE:
-        # A previous fast request may have switched the model to SDPA; restore
-        # flash-attention for the original path.
+        # Fast decode was requested but is unavailable; the prewarm may have
+        # switched the model's attention, so restore the default one.
         _set_llm_attention(state.model, _DEFAULT_ATTN_IMPL)
 
     batch["generate_kwargs"] = generate_kwargs
@@ -395,7 +368,7 @@ def run_inference(batch: dict, params: GenParams, request_id: str,
     if progress_callback:
         progress_callback(10, "model sampling")
 
-    with seeded_torch_rng(params.seed), torch.inference_mode():
+    with seeded_rng(params.seed), torch.inference_mode():
         preds: List[TokenRigResult] = state.model.predict_step(
             batch, make_asset=True, progress_callback=progress_callback or None,
         )["results"]
@@ -418,7 +391,9 @@ def run_inference(batch: dict, params: GenParams, request_id: str,
 def export_samples(preds: list, params: GenParams, request_id: str,
                    cancellation: Cancellation, progress_callback,
                    tmp_output_dir: Path) -> list[bytes]:
-    """Stage 3 (CPU): export each predicted asset to a GLB."""
+    """Stage 3 (CPU): export each predicted asset to a GLB (sample ``i`` under
+    ``derive_seed(params.seed, i)``: the rig transfer subsamples points)."""
+    from src.data.seeding import derive_seed, seeded_rng
     from src.rig_package.glb_io import InputLimits
     from src.rig_package.parser.glb import transfer_rigging
 
@@ -439,15 +414,16 @@ def export_samples(preds: list, params: GenParams, request_id: str,
 
         sample_out_path = tmp_output_dir / f"sample_{sample_idx}.glb"
         sample_out_path.parent.mkdir(parents=True, exist_ok=True)
-        transfer_rigging(
-            source_asset=asset,
-            target_path=asset.path,
-            export_path=str(sample_out_path),
-            group_per_vertex=4,
-            # Shift the whole scene so its bottom sits at Z=0.
-            auto_ground=True,
-            limits=limits,
-        )
+        with seeded_rng(derive_seed(params.seed, sample_idx)):
+            transfer_rigging(
+                source_asset=asset,
+                target_path=asset.path,
+                export_path=str(sample_out_path),
+                group_per_vertex=4,
+                # Shift the whole scene so its bottom sits at Z=0.
+                auto_ground=True,
+                limits=limits,
+            )
         glbs.append(sample_out_path.read_bytes())
         cancellation.raise_if_cancelled()
         _report_sample_progress(progress_callback, sample_count, sample_idx, "exported")
@@ -493,7 +469,8 @@ def run_job(params: dict, upload: bytes, cancellation: Cancellation, progress=No
     params = dict(params)
     suffix = params.pop("suffix")
     request_id = params.pop("request_id", "-")
-    gen = GenParams(**params)
+    gen = GenParams(**params).with_seed()
+    logger.info("[%s] seed=%d num_samples=%d", request_id, gen.seed, gen.num_samples)
     reporter = ProgressReporter(request_id, cancellation, progress)
 
     tmp_input_dir = Path(tempfile.mkdtemp(prefix="skintokens_input_"))

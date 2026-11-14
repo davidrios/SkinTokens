@@ -310,7 +310,10 @@ async def ws_generate(ws: WebSocket):
             await ws.close()
             return
 
-        params = GenParams(**{k: v for k, v in req.items() if k in GenParams.model_fields})
+        # Unknown fields (e.g. the sampling knobs older clients still send) are
+        # ignored. A request without a seed gets one here, so it can be reported
+        # with the result and the run reproduced.
+        params = GenParams(**{k: v for k, v in req.items() if k in GenParams.model_fields}).with_seed()
         logger.info("[%s] file decoded bytes=%d filename=%s params=%s",
                     request_id, len(file_data), filename, params.model_dump())
 
@@ -371,6 +374,7 @@ async def ws_generate(ws: WebSocket):
                 "stage": "done",
                 "sample_index": sample_idx,
                 "num_samples": len(results),
+                "seed": params.seed,
                 "elapsed_sec": round(time.time() - t0, 2),
                 "progress": 100,
                 "request_id": request_id,

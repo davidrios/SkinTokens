@@ -79,14 +79,8 @@ async def _run(args) -> None:
 
     payload = {
         "filename": filename,
-        "top_k": args.top_k,
-        "top_p": args.top_p,
-        "temperature": args.temperature,
-        "repetition_penalty": args.repetition_penalty,
-        "num_beams": args.num_beams,
         "num_samples": args.num_samples,
         "seed": args.seed,
-        "do_sample": True,
     }
 
     progress = ProgressDisplay()
@@ -140,6 +134,8 @@ async def _run(args) -> None:
                         pending_sample_index = int(message.get("sample_index", glb_count))
                         progress.update(100, "complete", message.get("elapsed_sec"))
                         progress.finish()
+                        if pending_sample_index == 0 and message.get("seed") is not None:
+                            print(f"[client] seed {message['seed']} (pass --seed to reproduce)")
                         # Binary GLB frame follows the done message
                         continue
                     elif stage == "cancelled":
@@ -172,14 +168,12 @@ def main() -> None:
     )
     parser.add_argument("--server", default="http://localhost:8087", help="Server base URL")
 
-    parser.add_argument("--top-k", type=int, default=5, help="Top-k sampling (default: 5)")
-    parser.add_argument("--top-p", type=float, default=0.95, help="Top-p sampling (default: 0.95)")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature (default: 1.0)")
-    parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Repetition penalty (default: 1.0)")
-    parser.add_argument("--num-beams", type=int, default=1, help="Number of beams (1-8, default: 1)")
-    parser.add_argument("--num-samples", type=int, default=1, help="Number of parallel samples to generate (1-8, default: 1)")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible generation")
-
+    parser.add_argument("--num-samples", type=int, default=1,
+                        help="Rigs to generate, each from a different point sampling of the mesh "
+                             "(limited by server SKINTOKENS_MAX_NUM_SAMPLES, default: 1)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed for the point sampling; the same seed and --num-samples reproduce the same "
+                             "outputs (default: random, printed after the run)")
 
     parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
     args = parser.parse_args()

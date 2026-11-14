@@ -1,5 +1,6 @@
 import argparse
 import os
+import secrets
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -11,6 +12,7 @@ from tqdm import tqdm
 os.environ["XFORMERS_IGNORE_FLASH_VERSION_CHECK"] = "1"
 
 from src.data.dataset import DatasetConfig, RigDatasetModule
+from src.data.seeding import derive_seed, enable_deterministic_kernels, sample_point_clouds, seeded_rng
 from src.data.transform import Transform
 from src.model.tokenrig import TokenRigResult
 from src.tokenizer.parse import get_tokenizer
@@ -70,19 +72,29 @@ def map_output_path(
     return (output_root / rel).with_suffix(".glb")
 
 
+def sample_output_path(out_path: Path, sample_idx: int, num_samples: int) -> Path:
+    if num_samples <= 1:
+        return out_path
+    return out_path.with_name(f"{out_path.stem}_{sample_idx}{out_path.suffix}")
+
+
 def run_rig(
     filepaths: List[Path],
-    top_k: int,
-    top_p: float,
-    temperature: float,
-    repetition_penalty: float,
-    num_beams: int,
     output_paths: List[Path],
     model_ckpt: str,
     hf_path: Optional[str],
+    seed: int,
+    num_samples: int = 1,
 ):
+    """Rig each file with greedy decoding: ``num_samples`` rigs per file, each
+    from its own point sampling of the mesh, all reproducible from ``seed``."""
     assert len(filepaths) == len(output_paths)
 
+    # Off by default (same as the server): a seed then reproduces only within
+    # this process. Set SKINTOKENS_DETERMINISTIC=1 for cross-run reproducibility
+    # at the cost of ~25% decode speed.
+    if os.environ.get("SKINTOKENS_DETERMINISTIC", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        enable_deterministic_kernels()
     load_model(model_ckpt, hf_path)
 
     datapath = {
@@ -107,7 +119,7 @@ def run_rig(
         process_fn=model._process_fn,
     )
 
-    dataloader = module.predict_dataloader()["articulation"]
+    dataset = module.predict_dataloader()["articulation"].dataset
 
     results_out = []
 
@@ -116,7 +128,14 @@ def run_rig(
         if torch.device(device).type == "cuda":
             torch.cuda.synchronize(device)
 
-    for i, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
+    for i in tqdm(range(len(dataset))):
+        # Every file is seeded on its own, so a file's result does not depend
+        # on which other files are in the run.
+        with seeded_rng(seed):
+            batch = dataset.collate_fn([dataset[i]])
+        asset = batch["model_input"][0].asset
+        vertices, normals = sample_point_clouds(asset, transform.sampler, seed, num_samples)
+        batch["vertices"], batch["normals"] = vertices.unsqueeze(0), normals.unsqueeze(0)
         batch = {
             k: v.to(model.device, non_blocking=True) if isinstance(v, Tensor) else v
             for k, v in batch.items()
@@ -126,49 +145,44 @@ def run_rig(
         batch.pop("skeleton_tokens", None)
         batch.pop("skeleton_mask", None)
 
-        batch["generate_kwargs"] = dict(
-            max_new_tokens=2048,
-            top_k=int(top_k),
-            top_p=float(top_p),
-            temperature=float(temperature),
-            repetition_penalty=float(repetition_penalty),
-            num_return_sequences=1,
-            num_beams=int(num_beams),
-            do_sample=True,
-        )
+        # Decoding is fixed to greedy single-beam search.
+        batch["generate_kwargs"] = dict(max_new_tokens=2048)
 
         # Synchronize around the timed section so CUDA work launched
         # asynchronously is included in the measured inference duration.
         # Batch loading/GLB parsing and GLB export both happen outside it.
         synchronize_inference_device()
         inference_started_at = time.perf_counter()
-        preds: List[TokenRigResult] = model.predict_step(
-            batch,
-            make_asset=True,
-        )["results"]
+        with seeded_rng(seed):
+            preds: List[TokenRigResult] = model.predict_step(
+                batch,
+                make_asset=True,
+            )["results"]
         synchronize_inference_device()
         inference_elapsed = time.perf_counter() - inference_started_at
         print(f"[PROFILE] Inference for {filepaths[i].name}: {inference_elapsed:.3f}s")
 
-        asset = preds[0].asset
-        assert asset is not None
-        collapsed_joints = asset.collapse_near_parent_joints()
-        if collapsed_joints:
-            print(f"[postprocess] Collapsed near-parent joints: {', '.join(collapsed_joints)}")
+        for sample_idx, pred in enumerate(preds):
+            asset = pred.asset
+            assert asset is not None
+            collapsed_joints = asset.collapse_near_parent_joints()
+            if collapsed_joints:
+                print(f"[postprocess] Collapsed near-parent joints: {', '.join(collapsed_joints)}")
 
-        out_path = output_paths[i]
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path = sample_output_path(output_paths[i], sample_idx, len(preds))
+            out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        transfer_rigging(
-            source_asset=asset,
-            target_path=asset.path,
-            export_path=str(out_path),
-            group_per_vertex=4,
-        )
+            with seeded_rng(derive_seed(seed, sample_idx)):
+                transfer_rigging(
+                    source_asset=asset,
+                    target_path=asset.path,
+                    export_path=str(out_path),
+                    group_per_vertex=4,
+                )
 
-        print(f"[OK] Exported: {out_path}")
+            print(f"[OK] Exported: {out_path}")
 
-        results_out.append(out_path)
+            results_out.append(out_path)
 
     return results_out
 
@@ -193,16 +207,16 @@ def run_cli(args):
             for f in files
         ]
 
+    seed = args.seed if args.seed is not None else secrets.randbits(63)
+    if args.seed is None:
+        print(f"[seed] {seed} (pass --seed to reproduce)")
     run_rig(
         files,
-        args.top_k,
-        args.top_p,
-        args.temperature,
-        args.repetition_penalty,
-        args.num_beams,
         outputs,
         args.model_ckpt,
         args.hf_path,
+        seed=seed,
+        num_samples=args.num_samples,
     )
 
 
@@ -211,12 +225,11 @@ if __name__ == "__main__":
     parser.add_argument("--input", help="Input file or directory")
     parser.add_argument("--output", default=None, help="Output file or directory (default: outputs/{input_name}_bind.glb)")
 
-    parser.add_argument("--top_k", type=int, default=5)
-    parser.add_argument("--top_p", type=float, default=0.95)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--repetition_penalty", type=float, default=1.0)
-    parser.add_argument("--num_beams", type=int, default=1)
-
+    parser.add_argument("--num-samples", "--num_samples", dest="num_samples", type=int, default=1,
+                        help="Rigs per input, each from a different point sampling of the mesh (default: 1)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed for the point sampling; the same seed and --num-samples reproduce "
+                             "the same outputs (default: random, printed)")
 
     parser.add_argument("--model_ckpt", default=MODEL_CKPTS[0] if MODEL_CKPTS else "")
     parser.add_argument("--hf_path", default=None)
@@ -225,5 +238,9 @@ if __name__ == "__main__":
 
     if not args.input:
         parser.error("--input is required for CLI mode. Use serve.py for the HTTP API server.")
+    if args.num_samples < 1:
+        parser.error("--num-samples must be >= 1")
+    if args.seed is not None and not 0 <= args.seed < 2**63:
+        parser.error("--seed must be in [0, 2**63)")
 
     run_cli(args)

@@ -153,12 +153,10 @@ Paths can be overridden with `SKINTOKENS_MODEL_ROOT`,
 checkpoint references such as `experiments/...` portable between host training
 and containers.
 
-Docker defaults to a lighter inference profile than the bare Python server:
-`SKINTOKENS_DEFAULT_NUM_BEAMS=4`, one sample, and CUDA cache release after each
-request. For the previous beam-search behavior, set:
+Docker defaults to one sample per request and CUDA cache release after each
+request. To keep the CUDA cache between requests, set:
 
 ```powershell
-$env:SKINTOKENS_DEFAULT_NUM_BEAMS = "8"
 $env:SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE = "0"
 docker compose up -d
 ```
@@ -176,16 +174,17 @@ python scripts/load_test.py --compare before.json after.json
 
 Each load-test run is capped at 120 seconds.
 
-With `SKINTOKENS_FAST_DECODE=1` (Compose default) each decode step replays a
-CUDA graph, and these switches control the rest of the step (defaults shown;
-set them to compare or to fall back):
+With fast decode on (the default) each decode step replays a CUDA graph, and
+these switches control the rest of the step (defaults shown; set them to
+compare or to fall back):
 
 | Variable | Default | Effect |
 |---|---|---|
 | `SKINTOKENS_DECODE_ATTN` | `triton` (`math` without Triton) | Decode attention over the static cache: `triton` computes only the filled slots, `math` is fused grouped-query attention over the whole cache, `sdpa` is the previous memory-efficient SDPA path. |
 | `SKINTOKENS_GPU_GRAMMAR` | `1` | Enforce the rig-token grammar with GPU state tensors instead of copying the sequence to the CPU every token. |
-| `SKINTOKENS_GRAMMAR_COMPILE` | `1` with CUDA + Triton | Fuse the grammar step with temperature/top-k/top-p into one compiled function. |
+| `SKINTOKENS_GRAMMAR_COMPILE` | `1` with CUDA + Triton | Fuse the grammar step (state update and logit mask) into one compiled function. |
 | `SKINTOKENS_DEFERRED_STOP` | `1` | Check for the end of generation one step late on CUDA, so the host never waits for the GPU between tokens. |
+| `SKINTOKENS_DETERMINISTIC` | `0` | Set to `1` for deterministic kernels, so a seed reproduces the same rig on every worker and across restarts. Off, decoding is about a third faster (2.1 vs 3.3 ms/token at batch 1), but a seed then reproduces only within one worker process. |
 
 For lower peak VRAM at the cost of much slower autoregressive decoding, set
 `SKINTOKENS_USE_CACHE=0`. `/dev/shm` can be adjusted with
@@ -202,13 +201,16 @@ single-worker dataloading.
 
 ### Generation Parameters
 
+Decoding is fixed to greedy single-beam search: there are no top-k, top-p,
+temperature, repetition-penalty or beam settings. The only randomness is where
+points are sampled on the input mesh, and that is controlled by the seed.
+`demo.py`, `skintokens_client.py` and the WebSocket API (`num_samples`, `seed`)
+take the same two parameters:
+
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `--top_k` | 1 | Top-k sampling |
-| `--top_p` | 1 | Top-p (nucleus) sampling |
-| `--temperature` | 0.1 | Sampling temperature |
-| `--repetition_penalty` | 1.0 | Repetition penalty |
-| `--num_beams` | 5 | Number of beams for beam search |
+| `--num-samples` | 1 | Rigs per input. The server rejects values above `SKINTOKENS_MAX_NUM_SAMPLES` (default: 1, configurable from 1 to 8). Sample `i` is decoded from its own point sampling of the mesh, so the samples differ from each other. |
+| `--seed` | random | Seed for the point sampling. The same input, seed and `--num-samples` give identical outputs on the same GPU and software stack. Without it a random seed is used and printed (the server returns it in each `done` message). |
 
 ### Troubleshooting
 

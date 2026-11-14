@@ -50,13 +50,12 @@ def supports(tokenizer) -> bool:
 
 def grammar_step(scores, tok, state, is_branch, bones, skin_count, switch_len, position,
                  transitions, masks, *, switch_id: int, branch_id: int, tokens_per_skin: int,
-                 advance: bool, temperature: float, top_k: int, top_p: float):
+                 advance: bool):
     """One decode step of the grammar, as a pure function (compiled as one graph).
 
-    Advances the per-row state by ``tok`` (when ``advance``), masks ``scores``
-    to the tokens the grammar allows next, then applies temperature, top-k and
-    top-p exactly as transformers' warpers do (in that order, after the other
-    logits processors), so they can be switched off in ``generate``.
+    Advances the per-row state by ``tok`` (when ``advance``) and masks
+    ``scores`` to the tokens the grammar allows next; greedy decoding then takes
+    the argmax of the result.
     """
     if advance:
         in_skin = state == SKIN
@@ -71,17 +70,6 @@ def grammar_step(scores, tok, state, is_branch, bones, skin_count, switch_len, p
     done = skin_count >= bones * tokens_per_skin
     row = torch.where(state == SKIN, torch.where(done, FINAL, SKIN), state)
     out = scores + masks[row]
-    if temperature != 1.0:
-        out = out / temperature
-    if top_k > 0:
-        values, indices = torch.topk(out, min(top_k, out.shape[-1]))  # descending
-        if top_p < 1.0:
-            ascending = values.flip(-1)
-            cumulative = ascending.softmax(dim=-1).cumsum(dim=-1)
-            remove = cumulative <= (1 - top_p)
-            remove[..., -1] = False  # min_tokens_to_keep=1
-            values = values.masked_fill(remove.flip(-1), float("-inf"))
-        out = torch.full_like(out, float("-inf")).scatter(-1, indices, values)
     return out, state, is_branch, bones, skin_count, switch_len, position
 
 
@@ -126,14 +114,7 @@ class GpuGrammarLogitsProcessor(LogitsProcessor):
         self._tables_key = None
         self._seen = 0
         self.state = None
-        # Warpers folded into the step (see configure_sampling); off by default.
-        self._sampling = (1.0, 0, 1.0)
         self._compile_failed = False
-
-    def configure_sampling(self, temperature: float, top_k: int, top_p: float) -> None:
-        """Apply temperature/top-k/top-p inside the grammar step; the caller
-        then disables transformers' own warpers for this generation."""
-        self._sampling = (float(temperature), int(top_k), float(top_p))
 
     # ── host-side reference, used once for the prompt ───────────────────────
 
@@ -242,13 +223,11 @@ class GpuGrammarLogitsProcessor(LogitsProcessor):
 
     # ── device update ────────────────────────────────────────────────────────
 
-    def _step(self, scores, tok, advance, warp):
-        temperature, top_k, top_p = self._sampling if warp else (1.0, 0, 1.0)
+    def _step(self, scores, tok, advance):
         args = (scores, tok, self.state, self.is_branch, self.bones, self.skin_count,
                 self.switch_len, self.position, self._transitions, self._masks)
         kwargs = dict(switch_id=self.switch_token_id, branch_id=self._branch_id,
-                      tokens_per_skin=self.tokens_per_skin, advance=advance,
-                      temperature=temperature, top_k=top_k, top_p=top_p)
+                      tokens_per_skin=self.tokens_per_skin, advance=advance)
         step = grammar_step if self._compile_failed else _get_step(scores.device)
         try:
             result = step(*args, **kwargs)
@@ -272,11 +251,11 @@ class GpuGrammarLogitsProcessor(LogitsProcessor):
         # is copied out of ``input_ids``: as a view its strides change every step,
         # which would recompile the step each time.
         for position in range(self._seen, length - 1):
-            self._step(scores, input_ids[:, position].clone(memory_format=torch.contiguous_format), advance=True, warp=False)
+            self._step(scores, input_ids[:, position].clone(memory_format=torch.contiguous_format), advance=True)
         if length > self._seen:
-            out = self._step(scores, input_ids[:, length - 1].clone(memory_format=torch.contiguous_format), advance=True, warp=True)
+            out = self._step(scores, input_ids[:, length - 1].clone(memory_format=torch.contiguous_format), advance=True)
         else:
-            out = self._step(scores, self.state, advance=False, warp=True)
+            out = self._step(scores, self.state, advance=False)
         self._seen = length
         return out
 

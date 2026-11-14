@@ -18,8 +18,7 @@ services:
       # Worker processes, each with its own model copy (~2-4 GB VRAM): up to this
       # many requests run in parallel on the GPU.
       SKINTOKENS_WORKERS: ${SKINTOKENS_WORKERS:-2}
-      SKINTOKENS_DEFAULT_NUM_BEAMS: 1
-      SKINTOKENS_DEFAULT_NUM_SAMPLES: 1
+      SKINTOKENS_MAX_NUM_SAMPLES: ${SKINTOKENS_MAX_NUM_SAMPLES:-1}
       SKINTOKENS_MAX_NEW_TOKENS: 2048
       SKINTOKENS_USE_CACHE: 1
       SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE: 1

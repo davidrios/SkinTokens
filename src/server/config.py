@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 
 from pydantic import BaseModel, Field
 
+from src.data.seeding import MAX_SEED
 from src.rig_package.glb_io.limits import upload_limit_mb
 
 logger = logging.getLogger("skintokens.serve")
@@ -53,8 +55,7 @@ WORKERS = env_int("SKINTOKENS_WORKERS", 2, 1, 32)
 # CPU threads per worker for torch/OpenMP (0 = an equal share of the cores).
 WORKER_CPU_THREADS = env_int("SKINTOKENS_WORKER_CPU_THREADS", 0, 0, 256)
 
-DEFAULT_NUM_BEAMS = env_int("SKINTOKENS_DEFAULT_NUM_BEAMS", 1, 1, 8)
-DEFAULT_NUM_SAMPLES = env_int("SKINTOKENS_DEFAULT_NUM_SAMPLES", 1, 1, 8)
+MAX_NUM_SAMPLES = env_int("SKINTOKENS_MAX_NUM_SAMPLES", 1, 1, 8)
 MAX_NEW_TOKENS = env_int("SKINTOKENS_MAX_NEW_TOKENS", 2048, 128, 4096)
 # Uploads are untrusted: capped in size here and parsed with resource limits
 # (SKINTOKENS_INPUT_* env vars, see src/rig_package/glb_io/limits.py), never
@@ -64,10 +65,13 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 USE_GENERATION_CACHE = env_flag("SKINTOKENS_USE_CACHE", True)
 EMPTY_CACHE_AFTER_INFERENCE = env_flag("SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE", True)
 # Fast decode: SDPA attention + static KV cache + CUDA-graph capture gives ~2x
-# on the autoregressive sampling stage, which dominates wall time. It requires
-# ``num_beams == 1`` (a static cache cannot do beam reordering); beam requests
-# transparently fall back to the original flash-attention + dynamic-cache path.
-FAST_DECODE = env_flag("SKINTOKENS_FAST_DECODE", False)
+# on the autoregressive decoding stage, which dominates wall time.
+FAST_DECODE = env_flag("SKINTOKENS_FAST_DECODE", True)
+# Deterministic kernels, so the same (input, seed, num_samples) gives the same
+# rig whichever worker serves it and across restarts; costs decode speed
+# (src.data.seeding.enable_deterministic_kernels). Off: reproducible only
+# within one worker process.
+DETERMINISTIC = env_flag("SKINTOKENS_DETERMINISTIC", False)
 # Compile backend for the fast decode path:
 #   "cudagraphs" (default) — Triton-free, CUDA-graph capture only (no op fusion),
 #                            works everywhere including Windows dev.
@@ -85,10 +89,15 @@ def worker_cpu_threads(workers: int) -> int:
 
 
 class GenParams(BaseModel):
-    top_k: int = 5
-    top_p: float = 0.95
-    temperature: float = 1.0
-    repetition_penalty: float = 1.0
-    num_beams: int = Field(default=DEFAULT_NUM_BEAMS, ge=1, le=8)
-    num_samples: int = Field(default=DEFAULT_NUM_SAMPLES, ge=1, le=8)
-    seed: int | None = None
+    """What a request may choose. Decoding itself is fixed (greedy, one beam),
+    so the outputs are a function of the input, ``seed`` and ``num_samples``:
+    sample ``i`` is decoded from a point cloud drawn under a seed derived from
+    ``(seed, i)`` (see :mod:`src.data.seeding`)."""
+    num_samples: int = Field(default=1, ge=1, le=MAX_NUM_SAMPLES)
+    seed: int | None = Field(default=None, ge=0, le=MAX_SEED)
+
+    def with_seed(self) -> "GenParams":
+        """These parameters with a seed: the requested one, else a random one."""
+        if self.seed is not None:
+            return self
+        return self.model_copy(update={"seed": secrets.randbits(63)})

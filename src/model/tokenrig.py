@@ -36,6 +36,13 @@ LLM_LOCAL_DIR = resolve_model_path("models/Qwen3-0.6B")
 # keep peak VRAM in check; override via SKINTOKENS_DECODE_JOINT_BATCH.
 DECODE_JOINT_BATCH = max(1, int(os.environ.get("SKINTOKENS_DECODE_JOINT_BATCH", "8")))
 
+# Decoding is fixed to greedy single-beam search (TokenRig.generate sets these);
+# passing any of them is a caller bug.
+FIXED_DECODING_KWARGS = frozenset({
+    "do_sample", "num_beams", "num_return_sequences", "num_samples",
+    "top_k", "top_p", "temperature", "repetition_penalty",
+})
+
 from .attention import LLM_ATTN_IMPL
 
 class VocabSwitchingLogitsProcessor(LogitsProcessor):
@@ -288,14 +295,10 @@ class TokenRig(ModelSpec):
             self.transformer = AutoModelForCausalLM.from_config(
                 config=llm_config, attn_implementation=LLM_ATTN_IMPL
             )
-        # Silence "not valid generation flags" warnings for sampling params
-        # that are passed via **kwargs but missing from the auto-generated config.
-        if not hasattr(self.transformer.generation_config, "top_p") or self.transformer.generation_config.top_p is None:
-            self.transformer.generation_config.top_p = None
-        if not hasattr(self.transformer.generation_config, "top_k") or self.transformer.generation_config.top_k is None:
-            self.transformer.generation_config.top_k = None
-        if not hasattr(self.transformer.generation_config, "temperature") or self.transformer.generation_config.temperature is None:
-            self.transformer.generation_config.temperature = None
+        # Decoding is greedy: clear sampling defaults so transformers does not
+        # warn that they are set while do_sample=False.
+        for flag in ("temperature", "top_k", "top_p"):
+            setattr(self.transformer.generation_config, flag, None)
         
         self.output_proj = nn.Sequential(
             nn.Linear(self.mesh_encoder.width, self.hidden_size),
@@ -388,41 +391,44 @@ class TokenRig(ModelSpec):
         return_decode_dict: bool=False,
         num_joints: int|None=None,
         parents: Tensor|None=None,
-        num_samples: int=1,
         progress_callback=None,
         **kwargs,
-    ) -> TokenRigResult | List[TokenRigResult]:
-        """
-        Generate N samples in parallel by replicating inputs along the batch dimension.
-        When num_samples=1, returns a single TokenRigResult (backward compatible).
-        When num_samples>1, returns a list of TokenRigResult.
+    ) -> List[TokenRigResult]:
+        """Greedily decode one rig per point cloud, all clouds in one batch.
+
+        ``vertices``/``normals`` are ``(S, N, 3)`` (S point clouds sampled from
+        the same mesh) or ``(N, 3)`` for a single one; returns S results.
+        Decoding is fixed to greedy single-beam search, so a result depends only
+        on its point cloud (and the batch size S, through kernel selection).
         """
         assert isinstance(self.vae.model, SkinFSQCVAEModel)
-        assert vertices.dim() == 2, 'do not support batch'
-        assert normals.dim() == 2, 'do not support batch'
-        if num_samples < 1:
-            raise ValueError(f"num_samples must be >= 1, got {num_samples}")
-        
+        fixed = FIXED_DECODING_KWARGS & kwargs.keys()
+        if fixed:
+            raise TypeError(f"decoding is fixed to greedy search; do not pass {sorted(fixed)}")
+        if vertices.dim() == 2:
+            vertices, normals = vertices.unsqueeze(0), normals.unsqueeze(0)
+        assert vertices.dim() == 3 and normals.shape == vertices.shape, 'expected (S, N, 3) point clouds'
+        num_samples = vertices.shape[0]
+
         if isinstance(skeleton_tokens, np.ndarray):
             skeleton_tokens = torch.from_numpy(skeleton_tokens).to(self.device)
-        
-        # Encode mesh condition once, then replicate for parallel sampling.
-        cond = torch.cat([vertices, normals], dim=-1).unsqueeze(0)  # (1, N, 6)
+
+        cond = torch.cat([vertices, normals], dim=-1)  # (S, N, 6)
+        # A fixed seed for the VAE's own point subsample: the clouds are already
+        # randomly sampled (and shuffled), so this only removes a second,
+        # unseeded source of run-to-run variation.
         _, cond_latents = self.vae.model._encode(
             x=None,
             cond=cond,
             num_tokens=self.tokens_per_skin,
             cond_tokens=self.tokens_skin_cond,
             return_z=False,
+            seed=0,
         )
         assert cond_latents is not None
 
         learned_mesh_cond = encode_mesh_cond(self.mesh_encoder, self.output_proj, self.tokens_skin_cond, {'vertices': vertices, 'normals': normals})
-        if num_samples > 1:
-            cond = cond.repeat(num_samples, 1, 1)
-            cond_latents = cond_latents.repeat(num_samples, 1, 1)
-            learned_mesh_cond = learned_mesh_cond.repeat(num_samples, 1, 1)
-        
+
         device = cond.device
         start_tokens_list = self.make_start_tokens(
             device=device,
@@ -440,29 +446,16 @@ class TokenRig(ModelSpec):
         
         # Note: progress callback during token generation is not supported
         # in transformers >=4.41 (CallbackHandler was removed). Use a custom
-        # stopping criterion instead, which is called once per decode step and
-        # works with beam search.
-        gen_kwargs = {k: v for k, v in kwargs.items() if k != 'repetition_penalty'}
+        # stopping criterion instead, which is called once per decode step.
+        gen_kwargs = dict(kwargs)
         logits_processor = get_logits_processor(
             tokenizer=self.tokenizer,
             eos=self.eos,
             tokens_per_skin=self.tokens_per_skin,
             start_tokens=start_tokens[0],
-            num_beams=int(gen_kwargs.get('num_beams') or 1),
         )
         from .grammar import GpuGrammarLogitsProcessor
         grammar = logits_processor[0] if isinstance(logits_processor[0], GpuGrammarLogitsProcessor) else None
-        # Fold temperature/top-k/top-p into the grammar's fused step (same order
-        # and semantics as transformers' warpers, which then stay off): for plain
-        # sampling with an explicit top-k.
-        if (grammar is not None and gen_kwargs.get('do_sample') and int(gen_kwargs.get('num_beams') or 1) == 1
-                and int(gen_kwargs.get('top_k') or 0) > 0):
-            grammar.configure_sampling(
-                temperature=float(gen_kwargs.get('temperature', 1.0) or 1.0),
-                top_k=int(gen_kwargs['top_k']),
-                top_p=float(gen_kwargs.get('top_p', 1.0) or 1.0),
-            )
-            gen_kwargs.update(temperature=1.0, top_k=0, top_p=1.0)
         if progress_callback is not None:
             max_new_tokens = int(gen_kwargs.get("max_new_tokens") or 240)
             estimated_total_tokens = max(240, min(max_new_tokens, 512))
@@ -484,7 +477,9 @@ class TokenRig(ModelSpec):
             eos_token_id=self.eos,
             pad_token_id=self.tokenizer.pad,
             logits_processor=logits_processor,
-            repetition_penalty=None,  # handled by logits_processor instead
+            # Greedy: the grammar masks the logits, then the argmax is taken.
+            do_sample=False,
+            num_beams=1,
             **gen_kwargs,
         )
         if progress_callback is not None:
@@ -523,9 +518,6 @@ class TokenRig(ModelSpec):
             res.skin_pred = d['skin_pred']
             res.detokenize_output = d['detokenize_output']
             outputs.append(res)
-        
-        if num_samples == 1:
-            return outputs[0]
         return outputs
 
     def _debug_export(
@@ -620,17 +612,20 @@ class TokenRig(ModelSpec):
         progress_callback=None,
         **kwargs
     ) -> Dict:
+        """``batch['vertices']``/``['normals']`` are ``(B, P, 3)`` (one point
+        cloud per item) or ``(B, S, P, 3)`` (S clouds per item, one result
+        each, see :func:`src.data.seeding.sample_point_clouds`)."""
         vertices: Tensor   = batch['vertices']
         normals : Tensor   = batch['normals']
         cls = batch['cls']
         generate_kwargs = deepcopy(batch['generate_kwargs'])
-        num_samples = generate_kwargs.pop('num_samples', 1)
-        if num_samples < 1:
-            raise ValueError(f"num_samples must be >= 1, got {num_samples}")
 
         if vertices.dim() == 2:
             vertices = vertices.unsqueeze(0)
             normals  = normals.unsqueeze(0)
+        if vertices.dim() == 3:
+            vertices = vertices.unsqueeze(1)
+            normals  = normals.unsqueeze(1)
         results = []
         if skeleton_tokens is None:
             skeleton_tokens = [None] * vertices.shape[0]
@@ -643,13 +638,10 @@ class TokenRig(ModelSpec):
                 cls=None if no_cls else cls[i],
                 parents=None if parents is None else parents[i],
                 num_joints=None if num_joints is None else num_joints[i],
-                num_samples=num_samples,
                 progress_callback=progress_callback,
-                **{k: v for k, v in generate_kwargs.items() if k != 'num_samples'}
+                **generate_kwargs,
             )
-            if num_samples == 1:
-                gen_results = [gen_results]
-            for res in gen_results:
+            for s, res in enumerate(gen_results):
                 if make_asset:
                     assert 'model_input' in batch, "need model_input to make asset (in validate/predict mode)"
                     if res.detokenize_output is None:
@@ -674,7 +666,7 @@ class TokenRig(ModelSpec):
                     res.asset = Asset.from_data(
                         vertices=asset.vertices,
                         faces=asset.faces,
-                        sampled_vertices=vertices[i].detach().float().cpu().numpy(),
+                        sampled_vertices=vertices[i, s].detach().float().cpu().numpy(),
                         sampled_skin=res.skin_pred.detach().float().cpu().numpy(),
                         joints=pred_joints,
                         parents=pred_parents,
@@ -800,16 +792,12 @@ def prepare_llm_tokens(
     _check(attention_mask, (B, seq_len))
     return inputs_ids, attention_mask, llm_skeleton_mask, llm_skin_mask
 
-def get_logits_processor(tokenizer: Tokenizer, eos: int, tokens_per_skin: int, start_tokens,
-                         num_beams: int = 1):
+def get_logits_processor(tokenizer: Tokenizer, eos: int, tokens_per_skin: int, start_tokens):
     # The GPU state machine needs no device sync per token; the host version
     # remains for other tokenizers and as a switch-off (SKINTOKENS_GPU_GRAMMAR=0).
     from . import grammar
-    # Beam search reorders/duplicates candidate rows. The GPU processor's
-    # incremental state is not reordered with them; the host processor derives
-    # the grammar from each row's full sequence and handles this correctly.
     processor_cls = (grammar.GpuGrammarLogitsProcessor
-                     if num_beams == 1 and grammar.gpu_grammar_enabled() and grammar.supports(tokenizer)
+                     if grammar.gpu_grammar_enabled() and grammar.supports(tokenizer)
                      else VocabSwitchingLogitsProcessor)
     processor = processor_cls(
         tokenizer=tokenizer,
