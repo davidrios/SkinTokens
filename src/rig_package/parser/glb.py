@@ -149,6 +149,7 @@ class GlbParser(AbstractParser):
         group_per_vertex: int=-1,
         do_not_normalize: bool=False,
         auto_ground: bool=False,
+        weight_bits: int=16,
         **kwargs,
     ):
         """Export the asset's own mesh (no materials) skinned to its skeleton as GLB."""
@@ -168,7 +169,8 @@ class GlbParser(AbstractParser):
         joint_names = asset.joint_names if asset.joint_names is not None else [f"unknown_{i}" for i in range(asset.J)]
         _export(scene, filepath, joints, parents, joint_names, skin,
                 group_per_vertex=group_per_vertex, normalize=not do_not_normalize,
-                auto_ground=auto_ground, armature_name=asset.armature_name or 'Armature')
+                auto_ground=auto_ground, armature_name=asset.armature_name or 'Armature',
+                weight_bits=weight_bits)
 
     @classmethod
     def _safe_make_dir(cls, path: str):
@@ -178,7 +180,8 @@ class GlbParser(AbstractParser):
 
 
 def _export(scene: Scene, filepath: str, joints_z_up: ndarray, parents, joint_names, skin,
-            group_per_vertex: int, normalize: bool, auto_ground: bool, armature_name: str='Armature'):
+            group_per_vertex: int, normalize: bool, auto_ground: bool, armature_name: str='Armature',
+            weight_bits: int=16):
     if not hasattr(filepath, 'write') and os.path.splitext(filepath)[1].lower() != '.glb':
         raise ValueError(f"Rigged export supports .glb only, got: {filepath}")
     offset = None
@@ -193,7 +196,7 @@ def _export(scene: Scene, filepath: str, joints_z_up: ndarray, parents, joint_na
     export_skinned_glb(
         scene, filepath, _to_y_up(joints_z_up), parents, [str(n) for n in joint_names], skin,
         group_per_vertex=group_per_vertex, normalize=normalize, offset=offset,
-        armature_name=armature_name,
+        armature_name=armature_name, weight_bits=weight_bits,
     )
 
 
@@ -274,6 +277,7 @@ def transfer_rigging(
     limits: Optional[InputLimits]=None,
     scene: Optional[Scene]=None,
     skin: Optional[ndarray | SparseSkin]=None,
+    weight_bits: int=16,
     **kwargs,
 ) -> Optional[bytes]:
     """Map a predicted (normalized-space) rig back onto the original file and export GLB.
@@ -289,6 +293,8 @@ def transfer_rigging(
 
     ``skin`` (per source vertex, dense or a :class:`SparseSkin`) replaces
     ``source_asset.skin``.
+    ``weight_bits`` selects 16-bit normalized weights or 32-bit floats;
+    ``do_not_normalize=True`` always keeps floats to preserve the supplied sums.
     """
     assert source_asset.matrix_local is not None
     assert source_asset.parents is not None
@@ -327,5 +333,6 @@ def transfer_rigging(
     out = io.BytesIO() if export_path is None else export_path
     _export(scene, out, target_joints, source_asset.parents, joint_names, skin,
             group_per_vertex=group_per_vertex, normalize=not do_not_normalize,
-            auto_ground=auto_ground, armature_name=source_asset.armature_name or 'Armature')
+            auto_ground=auto_ground, armature_name=source_asset.armature_name or 'Armature',
+            weight_bits=weight_bits)
     return out.getvalue() if export_path is None else None

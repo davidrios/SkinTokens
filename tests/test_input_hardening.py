@@ -13,8 +13,6 @@ from src.rig_package.glb_io import Builder, InputLimits
 from src.rig_package.info.asset import Asset
 from src.rig_package.parser.glb import GlbParser, transfer_rigging
 
-EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
-
 LIMITS = InputLimits()
 SECRET = b"SECRET-SERVER-FILE-CONTENT"
 TRIANGLE = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], "<f4")
@@ -198,10 +196,21 @@ def test_serve_never_uses_client_filename_as_path(monkeypatch):
                for s in seen)
 
 
-def test_in_memory_upload_parses_and_is_size_limited():
+def test_in_memory_upload_parses_and_is_size_limited(tmp_path):
     from src.rig_package.glb_io import load_scene
-    data = (EXAMPLES / "giraffe.glb").read_bytes()
-    assert load_scene(data, name="input.glb").vertex_count == load_scene(EXAMPLES / "giraffe.glb").vertex_count
+    b = Builder()
+    pos = b.accessor(TRIANGLE, 'VEC3', bounds=True)
+    b.data['meshes'] = [{'primitives': [{'attributes': {'POSITION': pos}}]}]
+    b.data['nodes'] = [{'mesh': 0}]
+    b.data['scenes'] = [{'nodes': [0]}]
+    data = b.to_bytes()
+    path = tmp_path / 'input.glb'
+    path.write_bytes(data)
+    memory_scene = load_scene(data, name='input.glb')
+    file_scene = load_scene(path)
+    assert memory_scene.vertex_count == file_scene.vertex_count == 3
+    np.testing.assert_array_equal(memory_scene.vertices(), TRIANGLE)
+    np.testing.assert_array_equal(memory_scene.vertices(), file_scene.vertices())
     with pytest.raises(ValueError, match="file size"):
         load_scene(data, limits=InputLimits(max_file_bytes=len(data) - 1), name="input.glb")
     with pytest.raises(ValueError, match="unsupported type"):

@@ -294,7 +294,24 @@ def _finish_sparse(ids: np.ndarray, w: np.ndarray, fallback_joint: int, normaliz
     return ids, w
 
 
-def _write_attribute(builder: Builder, values: np.ndarray, *, target=ARRAY_BUFFER, bounds=False):
+def _quantize_weights(weights: np.ndarray) -> np.ndarray:
+    """Largest-remainder UNORM16 weights, summing exactly to 65535 per vertex.
+
+    Quantize all WEIGHTS_n sets together, preserving zeros and bounding each
+    component's absolute error by one quantization step.
+    """
+    maximum = 65535
+    scaled = weights / weights.sum(axis=1, keepdims=True) * maximum
+    quantized = np.floor(scaled).astype(np.int64)
+    remaining = maximum - quantized.sum(axis=1)
+    order = np.argsort(-(scaled - quantized), axis=1, kind='stable')
+    rows, ranks = np.nonzero(np.arange(weights.shape[1])[None, :] < remaining[:, None])
+    quantized[rows, order[rows, ranks]] += 1
+    return quantized.astype(np.uint16)
+
+
+def _write_attribute(builder: Builder, values: np.ndarray, *, target=ARRAY_BUFFER, bounds=False,
+                     normalized=False):
     kind = {1: 'SCALAR', 2: 'VEC2', 3: 'VEC3', 4: 'VEC4', 16: 'MAT4'}[values.shape[1]]
     if values.dtype == np.uint8:
         component = 5121
@@ -306,7 +323,8 @@ def _write_attribute(builder: Builder, values: np.ndarray, *, target=ARRAY_BUFFE
         component = 5126
     if values.shape[1] == 1:
         values = values[:, 0]
-    return builder.accessor(values, kind, component=component, bounds=bounds, target=target)
+    return builder.accessor(values, kind, component=component, bounds=bounds, target=target,
+                            normalized=normalized)
 
 
 def _unit(v: np.ndarray) -> np.ndarray:
@@ -324,6 +342,7 @@ def export_skinned_glb(
     *,
     group_per_vertex: int = 4,
     normalize: bool = True,
+    weight_bits: int = 16,
     offset: Optional[np.ndarray] = None,
     armature_name: str = 'Armature',
 ):
@@ -334,6 +353,8 @@ def export_skinned_glb(
         skin: (N, J) weights for ``scene.vertices()`` in the same order, or
             their already selected top influences as a :class:`SparseSkin`.
         offset: optional (3,) translation applied to meshes and joints together.
+        weight_bits: 16 for normalized integer weights, 32 for float32.
+            Defaults to 16. With normalize=False, float32 preserves the sums.
 
     Output is the skinned mesh only: positions, normals, triangle
     indices and joint weights, baked into bind space (glTF ignores a skinned
@@ -344,11 +365,13 @@ def export_skinned_glb(
     with malformed_as_value_error(scene.document.path.name):
         _export_skinned_glb(scene, filepath, joints, parents, joint_names, skin,
                             group_per_vertex=group_per_vertex, normalize=normalize,
-                            offset=offset, armature_name=armature_name)
+                            weight_bits=weight_bits, offset=offset, armature_name=armature_name)
 
 
 def _export_skinned_glb(scene, filepath, joints, parents, joint_names, skin, *,
-                        group_per_vertex, normalize, offset, armature_name):
+                        group_per_vertex, normalize, weight_bits, offset, armature_name):
+    if weight_bits not in (16, 32):
+        raise ValueError('weight_bits must be 16 or 32')
     document = scene.document
     joints = np.asarray(joints, dtype=np.float64)
     parents = np.asarray(parents, dtype=np.int64)
@@ -395,6 +418,9 @@ def _export_skinned_glb(scene, filepath, joints, parents, joint_names, skin, *,
     joint_component = np.uint8 if J <= 256 else np.uint16
     if J > 65536:
         raise ValueError('Too many joints for a glTF skin')
+    integer_weights = normalize and weight_bits != 32
+    weights_all = (_quantize_weights(weights_all) if integer_weights
+                   else weights_all.astype(np.float32))
 
     scene_nodes = [0]
     meshes = []
@@ -422,7 +448,8 @@ def _export_skinned_glb(scene, filepath, joints, parents, joint_names, skin, *,
             for s in range(ids_all.shape[1] // 4):
                 cols = slice(4 * s, 4 * s + 4)
                 attrs[f'JOINTS_{s}'] = _write_attribute(builder, ids_all[sl, cols].astype(joint_component))
-                attrs[f'WEIGHTS_{s}'] = _write_attribute(builder, weights_all[sl, cols].astype(np.float32))
+                attrs[f'WEIGHTS_{s}'] = _write_attribute(builder, weights_all[sl, cols],
+                                                        normalized=integer_weights)
             vertex_offset += n
             out = {'attributes': attrs}
             indices = prim.faces.reshape(-1, 1).astype(np.uint16 if n <= 65535 else np.uint32)

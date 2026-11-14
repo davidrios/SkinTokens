@@ -212,6 +212,17 @@ take the same two parameters:
 | `--num-samples` | 1 | Rigs per input. The server rejects values above `SKINTOKENS_MAX_NUM_SAMPLES` (default: 1, configurable from 1 to 8). Sample `i` is decoded from its own point sampling of the mesh, so the samples differ from each other. |
 | `--seed` | random | Seed for the point sampling. The same input, seed and `--num-samples` give identical outputs on the same GPU and software stack. Without it a random seed is used and printed (the server returns it in each `done` message). |
 
+### GLB Weight Encoding
+
+GLB exports use normalized 16-bit integer skin weights by default (8 bytes per
+vertex for four influences, versus 16 bytes with float32). Integer weights sum
+exactly to 65535 per vertex before decoding, avoiding weight-sum drift during
+skinning. Python callers of `transfer_rigging`, `GlbParser.export_asset`, or
+`export_skinned_glb` can set `weight_bits=16` (default) or `32` for float32 weights.
+`do_not_normalize=True` (`normalize=False` in `export_skinned_glb`) always
+keeps float32 weights to preserve the supplied sums. Total file savings depend
+on geometry and index sizes.
+
 ### Troubleshooting
 
 - **Server fails to start**: Make sure `http_proxy` / `https_proxy` environment variables are unset or correctly configured.

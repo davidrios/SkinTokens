@@ -1,6 +1,7 @@
 """Native GLB I/O: load, rig transfer and export without bpy."""
 
 import builtins
+import io
 import json
 import struct
 from pathlib import Path
@@ -8,12 +9,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from src.rig_package.glb_io import Builder, Document, Y_UP_TO_Z_UP, load_scene
+from src.rig_package.glb_io import (Builder, Document, SparseSkin, Y_UP_TO_Z_UP,
+                                    export_skinned_glb, load_scene)
 from src.rig_package.info.asset import Asset
 from src.rig_package.parser.glb import GlbParser, transfer_rigging
-
-EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
-
 
 @pytest.fixture(autouse=True)
 def _block_bpy(monkeypatch):
@@ -77,9 +76,27 @@ def _write_transformed_mesh(path):
     b.write(path)
 
 
-@pytest.mark.parametrize("name", ["giraffe.glb", "horse_mesh_only.glb"])
-def test_transfer_roundtrip_preserves_mesh_and_rig(tmp_path, name):
-    src_path = EXAMPLES / name
+def _write_tetrahedron(path):
+    """Small non-planar mesh with material and UV data to strip on export."""
+    b = Builder()
+    pos = b.accessor(np.array([[0, 0, 0], [2, 0, 0], [0, 3, 0], [0, 0, 4]]),
+                     'VEC3', bounds=True)
+    uv = b.accessor(np.zeros((4, 2)), 'VEC2')
+    idx = b.accessor(np.array([0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3]),
+                     'SCALAR', component=5123)
+    b.data['materials'] = [{'pbrMetallicRoughness': {'baseColorFactor': [1, 0, 0, 1]}}]
+    b.data['meshes'] = [{'primitives': [{'attributes': {'POSITION': pos, 'TEXCOORD_0': uv},
+                                        'indices': idx, 'material': 0}]}]
+    b.data['nodes'] = [{'mesh': 0}]
+    b.data['scenes'] = [{'nodes': [0]}]
+    b.write(path)
+
+
+@pytest.mark.parametrize('write_mesh', [_write_tetrahedron, _write_transformed_mesh],
+                         ids=['tetrahedron', 'transformed_instances'])
+def test_transfer_roundtrip_preserves_mesh_and_rig(tmp_path, write_mesh):
+    src_path = tmp_path / 'input.glb'
+    write_mesh(src_path)
     original = GlbParser.load(str(src_path))
     assert original.N > 0 and original.F > 0
 
@@ -115,10 +132,15 @@ def test_transfer_roundtrip_preserves_mesh_and_rig(tmp_path, name):
         for prim in mesh["primitives"]:
             assert set(prim) <= {"attributes", "indices", "mode"}
             assert set(prim["attributes"]) <= {"POSITION", "NORMAL", "JOINTS_0", "WEIGHTS_0"}
+            weight_accessor = out_json['accessors'][prim['attributes']['WEIGHTS_0']]
+            assert weight_accessor['componentType'] == 5123
+            assert weight_accessor['normalized'] is True
 
 
 def test_export_asset_writes_rig_and_skinned_input_is_plain_mesh(tmp_path):
-    original = GlbParser.load(str(EXAMPLES / "giraffe.glb"))
+    src_path = tmp_path / 'input.glb'
+    _write_tetrahedron(src_path)
+    original = GlbParser.load(str(src_path))
     joints = np.array([[0, 0, 1.0], [0, 0, 2.0], [0, -1.0, 3.0]])
     skin = np.zeros((original.N, 3), np.float32)
     skin[:, 1] = 1
@@ -171,6 +193,80 @@ def test_fbx_is_rejected(tmp_path):
     path.write_bytes(b"Kaydara FBX Binary")
     with pytest.raises(ValueError, match="FBX"):
         GlbParser.load(str(path))
+
+
+@pytest.mark.parametrize('bits', [16, 32])
+@pytest.mark.parametrize('sparse', [False, True])
+def test_weight_encoding_roundtrip_across_sets(tmp_path, bits, sparse):
+    path = tmp_path / 'mesh.glb'
+    _write_transformed_mesh(path)
+    scene = load_scene(path)
+    weights = np.random.default_rng(7).random((scene.vertex_count, 8))
+    weights[0] = 0  # fallback must remain exactly one-hot
+    weights[1] = 1  # equal fractional remainders
+    weights[2] = [1, 0, 0, 0, 0, 0, 0, 0]
+    weights[3] = [1, 1e-12, 1e-8, 0, 0, 0, 0, 0]
+    weights /= np.maximum(weights.sum(axis=1, keepdims=True), 1e-20)
+    skin = weights
+    if sparse:
+        ids = np.argsort(-weights, axis=1, kind='stable')
+        skin = SparseSkin(ids, np.take_along_axis(weights, ids, axis=1))
+    out = io.BytesIO()
+    export_skinned_glb(scene, out, np.zeros((8, 3)), [-1] + [0] * 7,
+                       [str(j) for j in range(8)], skin,
+                       group_per_vertex=8, weight_bits=bits)
+    doc = Document(out.getvalue())
+    decoded = []
+    for mesh in doc.data['meshes']:
+        for prim in mesh['primitives']:
+            attrs = prim['attributes']
+            dense = np.zeros((doc.data['accessors'][attrs['WEIGHTS_0']]['count'], 8))
+            raw_sets = []
+            for s in range(2):
+                accessor = doc.data['accessors'][attrs[f'WEIGHTS_{s}']]
+                assert accessor['componentType'] == {16: 5123, 32: 5126}[bits]
+                assert accessor.get('normalized', False) == (bits != 32)
+                if bits != 32:
+                    raw_sets.append(np.frombuffer(doc.view_bytes(accessor['bufferView']),
+                                                  dtype='<u2').reshape(-1, 4))
+                ids = doc.accessor(attrs[f'JOINTS_{s}']).astype(int)
+                w = doc.accessor(attrs[f'WEIGHTS_{s}'])
+                np.add.at(dense, (np.arange(len(dense))[:, None], ids), w)
+            if raw_sets:
+                totals = np.concatenate(raw_sets, axis=1).sum(axis=1)
+                np.testing.assert_array_equal(totals, (1 << bits) - 1)
+            decoded.append(dense)
+    decoded = np.concatenate(decoded)
+    expected = weights.copy()
+    expected[0, 0] = 1
+    np.testing.assert_allclose(decoded.sum(axis=1), 1, atol=1e-7)
+    np.testing.assert_allclose(decoded, expected, rtol=0,
+                               atol=1e-7 if bits == 32 else 1 / ((1 << bits) - 1))
+    np.testing.assert_array_equal(decoded[expected == 0], 0)
+    # Any common bone translation must be reproduced without weight-sum drift.
+    translation = np.array([1000., -2000., 3000.])
+    np.testing.assert_allclose(decoded.sum(axis=1)[:, None] * translation,
+                               expected.sum(axis=1)[:, None] * translation, atol=1e-4)
+
+
+def test_transfer_weight_encoding_options_preserve_unnormalized_weights(tmp_path):
+    path = tmp_path / 'mesh.glb'
+    _write_transformed_mesh(path)
+    asset = GlbParser.load(path)
+    predicted = Asset.from_data(vertices=asset.vertices, joints=np.zeros((1, 3)),
+                                parents=np.array([-1]), joint_names=['root'],
+                                skin=np.full((asset.N, 1), 0.5))
+    for normalize, bits in [(True, 16), (True, 32), (False, 16)]:
+        doc = Document(transfer_rigging(predicted, target_path=path,
+                                        weight_bits=bits, do_not_normalize=not normalize))
+        for mesh in doc.data['meshes']:
+            for prim in mesh['primitives']:
+                index = prim['attributes']['WEIGHTS_0']
+                assert doc.data['accessors'][index]['componentType'] == (
+                    {16: 5123, 32: 5126}[bits] if normalize else 5126)
+                np.testing.assert_allclose(doc.accessor(index)[:, 0], 1 if normalize else 0.5)
+    with pytest.raises(ValueError, match='weight_bits must be 16 or 32'):
+        transfer_rigging(predicted, target_path=path, weight_bits=8)
 
 
 @pytest.mark.parametrize('mode', [5, 6])
