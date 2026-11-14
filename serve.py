@@ -344,13 +344,15 @@ def _is_benign_ws_disconnect(exc: BaseException) -> bool:
 class _RequestRecord:
     """One request's details: the source of its single summary log line and,
     when the server fails on it, of its dump (``dump/<date>/<request_id>/``: upload as
-    received, header frame, traceback and trace). Create it in the request's
-    handler task so the trace also collects the DEBUG lines of tasks it starts.
+    received, header frame, traceback (with the client address) and trace). Create it
+    in the request's handler task so the trace also collects the DEBUG lines of tasks it
+    starts.
     """
 
     def __init__(self, request_id: str, client) -> None:
         self.request_id = request_id
         self.client = client
+        self.client_addr = self._client_address(client)
         self.started = time.monotonic()
         self.status = "started"
         self.error: Optional[str] = None
@@ -385,6 +387,17 @@ class _RequestRecord:
         self.status = "rejected"
         self.error = message
 
+    @staticmethod
+    def _client_address(client) -> str:
+        """The client's ``ip:port`` (``-`` when no address is known)."""
+        if client is None:
+            return "-"
+        if hasattr(client, "host"):  # Starlette Address
+            return f"{client.host}:{client.port}"
+        if isinstance(client, tuple) and len(client) == 2:
+            return f"{client[0]}:{client[1]}"
+        return str(client)
+
     def dump_files(self) -> dict[str, bytes]:
         files: dict[str, bytes] = {}
         if self.upload is not None:
@@ -392,7 +405,8 @@ class _RequestRecord:
             files["input" + (suffix if suffix in SUPPORTED_EXT else ".bin")] = self.upload
         if self.raw_header is not None:
             files["params.json" if self.header_valid else "params.txt"] = self.raw_header.encode("utf-8")
-        files["traceback.txt"] = (self.traceback or self.error or "").encode("utf-8")
+        body = self.traceback or self.error or ""
+        files["traceback.txt"] = f"client={self.client_addr}\n\n{body}".encode("utf-8")
         files["trace.log"] = self.trace.text().encode("utf-8")
         return files
 
