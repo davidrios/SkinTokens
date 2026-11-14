@@ -204,13 +204,14 @@ single-worker dataloading.
 Decoding is fixed to greedy single-beam search: there are no top-k, top-p,
 temperature, repetition-penalty or beam settings. The only randomness is where
 points are sampled on the input mesh, and that is controlled by the seed.
-`demo.py`, `skintokens_client.py` and the WebSocket API (`num_samples`, `seed`)
-take the same two parameters:
+`demo.py` takes the sampling parameters below; `skintokens_client.py` and the
+WebSocket API take those and `output`, the result format:
 
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `--num-samples` | 1 | Rigs per input. The server rejects values above `SKINTOKENS_MAX_NUM_SAMPLES` (default: 1, configurable from 1 to 8). Sample `i` is decoded from its own point sampling of the mesh, so the samples differ from each other. |
 | `--seed` | random | Seed for the point sampling. The same input, seed and `--num-samples` give identical outputs on the same GPU and software stack. Without it a random seed is used and printed (the server returns it in each `done` message). |
+| `--output-format` (WebSocket: `output`) | `rig` | What the server sends: `rig`, a rig payload that the client turns into the uploaded file with the skeleton and skin added (see [Server Results: Rig Payloads](#server-results-rig-payloads)); or `glb`, the server's skinned-mesh-only GLB, served only with `SKINTOKENS_ENABLE_GLB_OUTPUT=1`. |
 
 ### GLB Weight Encoding
 
@@ -222,6 +223,64 @@ skinning. Python callers of `transfer_rigging`, `GlbParser.export_asset`, or
 `do_not_normalize=True` (`normalize=False` in `export_skinned_glb`) always
 keeps float32 weights to preserve the supplied sums. Total file savings depend
 on geometry and index sizes.
+
+### Server Results: Rig Payloads
+
+Most of a rigged GLB is the input's own positions, normals and triangles,
+which the client already has. So the server returns a **rig payload** by default:
+just the skeleton and the per-vertex joint influences, zlib-compressed. On
+`examples/giraffe.glb` that is 96 KB instead of a 670 KB GLB. Nothing is
+approximated, and the client adds the rig to the very file it uploaded, so the
+result keeps everything the server's skinned-mesh-only GLB drops.
+
+| Client | How |
+| --- | --- |
+| Python | `skintokens_client.py` does it by default. In code: `apply_rig(uploaded_bytes, payload, name="input.glb")` from `src.rig_package.glb_io` returns the input as a GLB with the rig added. (`build_glb` with the same arguments returns the server's GLB instead, byte for byte.) |
+| three.js | [`clients/threejs/skintokens-rig.js`](clients/threejs/skintokens-rig.js): `await applyRigPayload(gltf, await decodeRigPayload(payload))` turns the meshes `GLTFLoader` loaded from the uploaded file into `SkinnedMesh`es on the new skeleton. |
+
+`apply_rig` keeps the input's node hierarchy and transforms, materials,
+textures, UVs, animations, extensions and all existing data. Embedded `.gltf`
+buffers move into the GLB's binary chunk, with their bytes unchanged. It only
+adds the following:
+- **Skeleton:** an armature node holding the joints, added to the default scene.
+- **Skins:** each inverse bind matrix includes the mesh node's placement, so vertex data is left as stored. glTF ignores a skinned mesh node's own transform. Skins of the input that no node refers to any more are dropped.
+- **`JOINTS_0`/`WEIGHTS_0`:** added to every primitive of the rigged meshes, replacing any the input had. Points and lines take the influences of their nearest rigged vertex.
+- **Mesh copies:** a mesh used by several nodes gets one copy per extra node, sharing its geometry, so each use can have its own weights.
+
+The model keeps its place; the server's ground shift is not applied. The
+glTF validator reports no errors on these files. It does warn
+`NODE_SKINNED_MESH_NON_ROOT`/`NODE_SKINNED_MESH_LOCAL_TRANSFORMS` when a
+rigged mesh sits under transformed nodes: that's the kept hierarchy, and the
+skins already account for it.
+
+**Protocol.** The request header names the format: `{"filename": ..., "output": "rig"}`.
+`output` defaults to `"rig"`, and `/health` lists the formats the server
+supports in `output_formats`. Each result is a `done` message (`"format":
+"rig"`, `"payload_size": N`) followed by one binary frame. The whole GLB
+(`"output": "glb"`) is served only when the server sets
+`SKINTOKENS_ENABLE_GLB_OUTPUT=1`; any other request is refused before its
+upload.
+
+**Format** (version 1, little-endian; full spec in
+[`rig_payload.py`](src/rig_package/glb_io/rig_payload.py)). The container is
+laid out like a GLB: `"SKRG"`, `u32 version`, `u32 total length`, then a JSON
+chunk and a BIN chunk.
+- **JSON chunk:**
+  - `joint_names`, `parents` (`-1` for roots), and `joint_heads`, which are bind-pose heads in glTF world space (Y-up).
+  - `ground_offset`, the shift the server applies to meshes and joints together to put the model on the ground.
+  - `vertex_count`, and `influences` (4).
+  - The byte ranges of the two arrays, and `bin.compression`, which is `zlib` (RFC 1950, which browsers call `"deflate"` in `DecompressionStream`).
+  - `layout`.
+- **BIN chunk:** two row-major `(vertex_count, 4)` arrays: `joint_indices` (`uint8`, or `uint16` above 256 joints) and `joint_weights` (normalized `uint16`, each row summing to 65535).
+
+Rows follow `layout`, which spells out the vertex order:
+- The default scene's mesh nodes, depth-first.
+- Within each node, its triangle primitives in order. Each primitive's `index` is its position in the glTF mesh's `primitives` list; points, lines and primitives without triangles are skipped.
+- A mesh used by several nodes appears once per node.
+- `skinned_input` marks nodes that were skinned in the input. The server used their vertices as stored and ignored their node transform.
+
+Clients check `layout` against their own copy of the file, so a payload
+applied to the wrong file is an error rather than a corrupt rig.
 
 ### Troubleshooting
 

@@ -2,7 +2,7 @@
 
 Each worker process (:mod:`src.server.worker`) loads its own copy of the model
 with :func:`load` and serves one request at a time with :func:`run_job`:
-parse the upload, sample the rig on the GPU, export the GLB(s). Nothing here is
+parse the upload, sample the rig on the GPU, export the rig payload(s) or GLB(s). Nothing here is
 shared between requests running in different workers, so the stages need no
 locks: the parallelism comes from running several workers.
 
@@ -27,6 +27,7 @@ if not os.path.exists("/dev/dxg"):
 
 import dataclasses
 import gc
+import io
 import logging
 import threading
 import time
@@ -431,21 +432,24 @@ def export_samples(preds: list, params: GenParams, request_id: str,
                    cancellation: Cancellation, progress_callback,
                    tmp_output_dir: Optional[Path] = None, scene=None,
                    source=None) -> list[bytes]:
-    """Stage 3 (CPU): export each predicted asset to a GLB (sample ``i`` under
+    """Stage 3 (CPU): export each predicted asset in the ``params.output``
+    format, a rig payload or a GLB (sample ``i`` under
     ``derive_seed(params.seed, i)``: the rig transfer subsamples points).
+    Both come from the same :class:`SkinnedRig`, so the GLB a client rebuilds
+    from a rig payload is the GLB this would have returned.
 
     ``scene`` is the input already parsed by :func:`prepare_inputs`; without it
     ``source`` (an :class:`Upload` or a path, else the asset's own path) is
-    parsed once here. ``tmp_output_dir`` is unused (GLBs are built in memory)
+    parsed once here. ``tmp_output_dir`` is unused (results are built in memory)
     and kept for callers.
     """
     from src.data.seeding import derive_seed, seeded_rng
-    from src.rig_package.glb_io import InputLimits, SparseSkin
-    from src.rig_package.parser.glb import transfer_rigging
+    from src.rig_package.glb_io import InputLimits, SparseSkin, encode_rig_payload, write_skinned_glb
+    from src.rig_package.parser.glb import transfer_rig
     from src.rig_package.skin_interp import interpolate_top_k
 
     sample_count = max(len(preds), 1)
-    glbs: list[bytes] = []
+    outputs: list[bytes] = []
     if scene is None and preds:
         scene = _load_input(source or preds[0].asset.path, InputLimits.from_env())
 
@@ -472,20 +476,25 @@ def export_samples(preds: list, params: GenParams, request_id: str,
             skin = SparseSkin(ids, weights)
 
         with seeded_rng(derive_seed(params.seed, sample_idx)):
-            glb = transfer_rigging(
+            rig = transfer_rig(
                 source_asset=asset,
                 scene=scene,
                 skin=skin,
-                export_path=None,  # build the GLB in memory
                 group_per_vertex=GROUP_PER_VERTEX,
                 # Shift the whole scene so its bottom sits at Z=0.
                 auto_ground=True,
             )
-        glbs.append(glb)
+        if params.output == "rig":
+            outputs.append(encode_rig_payload(scene, rig))
+        else:
+            out = io.BytesIO()  # the GLB is built in memory
+            write_skinned_glb(scene, out, rig)
+            outputs.append(out.getvalue())
+        del rig
         cancellation.raise_if_cancelled()
         _report_sample_progress(progress_callback, sample_count, sample_idx, "exported")
 
-    return glbs
+    return outputs
 
 
 class ProgressReporter:
@@ -518,7 +527,8 @@ STAGES = {"prepare": prepare_inputs, "infer": run_inference, "export": export_sa
 
 
 def run_job(params: dict, upload: bytes, cancellation: Cancellation, progress=None) -> list[bytes]:
-    """One request (a worker's ``run``): the rigged GLB bytes, one per sample.
+    """One request (a worker's ``run``): one result per sample, a rig payload
+    or a GLB as ``params["output"]`` asks.
 
     *params* holds the :class:`GenParams` fields plus ``suffix`` (the upload's
     file extension) and ``request_id``.
@@ -527,7 +537,8 @@ def run_job(params: dict, upload: bytes, cancellation: Cancellation, progress=No
     suffix = params.pop("suffix")
     request_id = params.pop("request_id", "-")
     gen = GenParams(**params).with_seed()
-    logger.debug("[%s] seed=%d num_samples=%d", request_id, gen.seed, gen.num_samples)
+    logger.debug("[%s] seed=%d num_samples=%d output=%s", request_id, gen.seed,
+                 gen.num_samples, gen.output)
     reporter = ProgressReporter(request_id, cancellation, progress)
 
     # Parsed straight from memory. The client's filename is used for nothing:
@@ -538,11 +549,11 @@ def run_job(params: dict, upload: bytes, cancellation: Cancellation, progress=No
     scene = batch.pop("scene", None) if isinstance(batch, dict) else None
     preds = STAGES["infer"](batch, gen, request_id, cancellation, reporter.report)
     del batch
-    glbs = STAGES["export"](preds, gen, request_id, cancellation, reporter.report,
-                            scene=scene, source=source)
+    outputs = STAGES["export"](preds, gen, request_id, cancellation, reporter.report,
+                               scene=scene, source=source)
     del preds, scene, source
     reporter.report(100, "complete")
-    return glbs
+    return outputs
 
 
 SERVICE = ServiceSpec("skintokens", load, run_job, release_memory)

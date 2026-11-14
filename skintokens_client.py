@@ -4,7 +4,13 @@ Example:
     python skintokens_client.py --input assets/character.glb --output out.glb
     python skintokens_client.py --input model.glb --server http://HOST:8087
 
-Requires the ``websockets`` package.
+By default the server sends a rig payload (skeleton and skin only, several
+times smaller than a GLB) and this client adds it to the input file: the output
+is the input GLB/glTF (as a GLB) with its node structure, materials, textures
+and UVs kept, plus the skeleton and skin. That needs NumPy, SciPy and this
+repository's ``src`` package next to the script. ``--output-format glb`` asks
+for the server's GLB instead (the skinned mesh only, no materials; served only
+with SKINTOKENS_ENABLE_GLB_OUTPUT=1) and needs only ``websockets``.
 """
 import argparse
 import asyncio
@@ -63,6 +69,34 @@ def _sample_output_path(output_path: str, sample_index: int, total_samples: int)
     return str(path.with_name(f"{path.stem}_{sample_index}{path.suffix or '.glb'}"))
 
 
+def _write(path: str, data: bytes) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def _rebuilder(file_data: bytes, filename: str):
+    """A function turning a rig payload into ``file_data`` rigged: the input
+    file with the skeleton and skin added, its materials, textures and node
+    structure kept.
+
+    The input is parsed once (as the server parsed the upload) for all samples.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from src.rig_package.glb_io import apply_rig, load_scene
+        # apply_rig imports SciPy lazily, for primitives without rig rows, so
+        # probe it here where the failure can still be explained.
+        import scipy.spatial  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError(
+            f"applying the rig needs NumPy, SciPy and this repository's src package ({exc}); "
+            "or pass --output-format glb if the server serves GLBs"
+        ) from exc
+    scene = load_scene(file_data, name="input" + Path(filename).suffix.lower())
+    return lambda payload: apply_rig(scene, payload)
+
+
 async def _run(args) -> None:
     try:
         import websockets
@@ -81,7 +115,10 @@ async def _run(args) -> None:
         "filename": filename,
         "num_samples": args.num_samples,
         "seed": args.seed,
+        "output": args.output_format,
     }
+    # Parsed before connecting, so an input that cannot be rigged fails early.
+    rebuild = _rebuilder(file_data, filename) if args.output_format == "rig" else None
 
     progress = ProgressDisplay()
     started_at = time.monotonic()
@@ -92,7 +129,8 @@ async def _run(args) -> None:
             # Rigged GLBs grow with the mesh (about 70 bytes per vertex).
             max_size=1024 * 1024 * 1024,
             open_timeout=args.timeout,
-            # GLB data barely compresses; deflating it costs seconds.
+            # GLB data barely compresses; deflating it costs seconds. Rig
+            # payloads arrive compressed already.
             compression=None,
         ) as ws:
             await ws.send(json.dumps(payload))
@@ -101,18 +139,21 @@ async def _run(args) -> None:
             glb_count = 0
             expected_samples = args.num_samples
             pending_sample_index = 0
+            pending_format = args.output_format
             try:
                 async for raw_message in ws:
                     if isinstance(raw_message, bytes):
-                        glb = raw_message
                         sample_output = _sample_output_path(
                             args.output, pending_sample_index, expected_samples
                         )
                         glb_count += 1
-                        output_dir = os.path.dirname(os.path.abspath(sample_output))
-                        os.makedirs(output_dir, exist_ok=True)
-                        with open(sample_output, "wb") as f:
-                            f.write(glb)
+                        if pending_format == "rig":
+                            glb = rebuild(raw_message)
+                            print(f"[client] received {len(raw_message)} bytes (rig payload); "
+                                  f"added the rig to the input ({len(glb)} bytes GLB)")
+                        else:
+                            glb = raw_message
+                        _write(sample_output, glb)
                         print(f"[client] saved {len(glb)} bytes -> {sample_output}")
                         if glb_count >= expected_samples:
                             return
@@ -135,11 +176,16 @@ async def _run(args) -> None:
                     elif stage == "done":
                         expected_samples = int(message.get("num_samples", expected_samples))
                         pending_sample_index = int(message.get("sample_index", glb_count))
+                        pending_format = message.get("format", args.output_format)
+                        if pending_format not in ("rig", "glb"):
+                            raise RuntimeError(f"server sent an unknown format {pending_format!r}")
+                        if pending_format == "rig" and rebuild is None:
+                            rebuild = _rebuilder(file_data, filename)
                         progress.update(100, "complete", message.get("elapsed_sec"))
                         progress.finish()
                         if pending_sample_index == 0 and message.get("seed") is not None:
                             print(f"[client] seed {message['seed']} (pass --seed to reproduce)")
-                        # Binary GLB frame follows the done message
+                        # The result frame (rig payload or GLB) follows the done message
                         continue
                     elif stage == "cancelled":
                         raise asyncio.CancelledError(message.get("message"))
@@ -178,6 +224,11 @@ def main() -> None:
                         help="Seed for the point sampling; the same seed and --num-samples reproduce the same "
                              "outputs (default: random, printed after the run)")
 
+    parser.add_argument("--output-format", choices=("rig", "glb"), default="rig",
+                        help="What the server sends: 'rig' (default), the skeleton and skin, "
+                             "added here to the input file (materials and textures kept); "
+                             "'glb', the server's skinned-mesh-only GLB (served only with "
+                             "SKINTOKENS_ENABLE_GLB_OUTPUT=1)")
     parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
     args = parser.parse_args()
 

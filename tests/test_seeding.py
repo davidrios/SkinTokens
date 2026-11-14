@@ -81,8 +81,9 @@ def test_point_clouds_reproduce_per_seed_and_differ_per_sample():
     assert not torch.equal(v_other[0], v1[0])
 
 
-def test_gen_params_expose_only_seed_and_samples():
-    assert set(GenParams.model_fields) == {"num_samples", "seed"}
+def test_gen_params_expose_only_seed_samples_and_output():
+    assert set(GenParams.model_fields) == {"num_samples", "seed", "output"}
+    assert GenParams().output == "rig"  # the server's compact result by default
     assert GenParams(seed=9).with_seed().seed == 9
     assert GenParams().with_seed().seed is not None
     with pytest.raises(ValueError):

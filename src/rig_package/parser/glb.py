@@ -14,7 +14,8 @@ from typing import Optional
 import numpy as np
 from numpy import ndarray
 
-from ..glb_io import Y_UP_TO_Z_UP, Z_UP_TO_Y_UP, Document, InputLimits, Scene, SparseSkin, export_skinned_glb, load_scene
+from ..glb_io import (Y_UP_TO_Z_UP, Z_UP_TO_Y_UP, Document, InputLimits, Scene, SkinnedRig, SparseSkin,
+                      load_scene, prepare_skinned_rig, write_skinned_glb)
 from ..glb_io.scene import asset_mesh_glb_bytes
 from ..info.asset import Asset
 from ..utils import mesh_normals
@@ -184,6 +185,16 @@ def _export(scene: Scene, filepath: str, joints_z_up: ndarray, parents, joint_na
             weight_bits: int=16):
     if not hasattr(filepath, 'write') and os.path.splitext(filepath)[1].lower() != '.glb':
         raise ValueError(f"Rigged export supports .glb only, got: {filepath}")
+    rig = _skinned_rig(scene, joints_z_up, parents, joint_names, skin,
+                       group_per_vertex=group_per_vertex, normalize=normalize,
+                       auto_ground=auto_ground, armature_name=armature_name,
+                       weight_bits=weight_bits)
+    write_skinned_glb(scene, filepath, rig)
+
+
+def _skinned_rig(scene: Scene, joints_z_up: ndarray, parents, joint_names, skin,
+                 group_per_vertex: int, normalize: bool, auto_ground: bool,
+                 armature_name: str='Armature', weight_bits: int=16) -> SkinnedRig:
     offset = None
     if auto_ground:
         # Shift everything so the bounding-box bottom sits on the ground plane
@@ -193,8 +204,8 @@ def _export(scene: Scene, filepath: str, joints_z_up: ndarray, parents, joint_na
             min_y = float(vertices[:, 1].min())
             if abs(min_y) >= 1e-6:
                 offset = np.array([0., -min_y, 0.])
-    export_skinned_glb(
-        scene, filepath, _to_y_up(joints_z_up), parents, [str(n) for n in joint_names], skin,
+    return prepare_skinned_rig(
+        scene, _to_y_up(joints_z_up), parents, [str(n) for n in joint_names], skin,
         group_per_vertex=group_per_vertex, normalize=normalize, offset=offset,
         armature_name=armature_name, weight_bits=weight_bits,
     )
@@ -296,19 +307,43 @@ def transfer_rigging(
     ``weight_bits`` selects 16-bit normalized weights or 32-bit floats;
     ``do_not_normalize=True`` always keeps floats to preserve the supplied sums.
     """
+    if (export_path is not None and not hasattr(export_path, 'write')
+            and os.path.splitext(export_path)[1].lower() != '.glb'):
+        raise ValueError(f"Rigged export supports .glb only, got: {export_path}")
+    if scene is None:
+        if target_path is None:
+            raise ValueError("transfer_rigging needs a scene or a target_path")
+        scene = load_scene(target_path, limits=limits)
+    rig = transfer_rig(source_asset, scene, group_per_vertex=group_per_vertex,
+                       auto_ground=auto_ground, max_points=max_points,
+                       do_not_normalize=do_not_normalize, skin=skin, weight_bits=weight_bits)
+    out = io.BytesIO() if export_path is None else export_path
+    write_skinned_glb(scene, out, rig)
+    return out.getvalue() if export_path is None else None
+
+
+def transfer_rig(
+    source_asset: Asset,
+    scene: Scene,
+    group_per_vertex: int=4,
+    auto_ground: bool=False,
+    max_points: Optional[int]=None,
+    do_not_normalize: bool=False,
+    skin: Optional[ndarray | SparseSkin]=None,
+    weight_bits: int=16,
+) -> SkinnedRig:
+    """The rig :func:`transfer_rigging` writes into ``scene``'s GLB (same
+    arguments), without writing it: what a rig payload carries
+    (:mod:`src.rig_package.glb_io.rig_payload`)."""
     assert source_asset.matrix_local is not None
     assert source_asset.parents is not None
     source_vertices = source_asset.vertices
     source_joints = source_asset.joints
     assert source_vertices is not None and source_joints is not None
 
-    if scene is None:
-        if target_path is None:
-            raise ValueError("transfer_rigging needs a scene or a target_path")
-        scene = load_scene(target_path, limits=limits)
     target_vertices = _to_z_up(scene.vertices())
     if len(target_vertices) == 0:
-        raise ValueError(f"No mesh vertices found in {target_path or scene.document.path}")
+        raise ValueError(f"No mesh vertices found in {scene.document.path}")
 
     T = estimate_similarity_transform(src=source_vertices, tgt=target_vertices, max_points=max_points or 4096)
     target_joints = source_joints @ T[:3, :3].T + T[:3, 3]
@@ -330,9 +365,7 @@ def transfer_rigging(
         skin = source_skin.take(idx) if isinstance(source_skin, SparseSkin) else source_skin[idx]
 
     joint_names = source_asset.joint_names if source_asset.joint_names is not None else [f"unknown_{i}" for i in range(J)]
-    out = io.BytesIO() if export_path is None else export_path
-    _export(scene, out, target_joints, source_asset.parents, joint_names, skin,
-            group_per_vertex=group_per_vertex, normalize=not do_not_normalize,
-            auto_ground=auto_ground, armature_name=source_asset.armature_name or 'Armature',
-            weight_bits=weight_bits)
-    return out.getvalue() if export_path is None else None
+    return _skinned_rig(scene, target_joints, source_asset.parents, joint_names, skin,
+                        group_per_vertex=group_per_vertex, normalize=not do_not_normalize,
+                        auto_ground=auto_ground, armature_name=source_asset.armature_name or 'Armature',
+                        weight_bits=weight_bits)

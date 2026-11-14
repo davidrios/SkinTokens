@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -56,6 +57,11 @@ WORKERS = env_int("SKINTOKENS_WORKERS", 2, 1, 32)
 WORKER_CPU_THREADS = env_int("SKINTOKENS_WORKER_CPU_THREADS", 0, 0, 256)
 
 MAX_NUM_SAMPLES = env_int("SKINTOKENS_MAX_NUM_SAMPLES", 1, 1, 8)
+# Result formats a request may ask for (GenParams.output). "rig" sends only the
+# skeleton and skin, which the client adds to the file it uploaded
+# (src/rig_package/glb_io/rig_payload.py); the whole GLB is several times
+# larger and served only when SKINTOKENS_ENABLE_GLB_OUTPUT=1.
+OUTPUT_FORMATS = ("rig", "glb") if env_flag("SKINTOKENS_ENABLE_GLB_OUTPUT", False) else ("rig",)
 MAX_NEW_TOKENS = env_int("SKINTOKENS_MAX_NEW_TOKENS", 2048, 128, 4096)
 # Uploads are untrusted: capped in size here and parsed with resource limits
 # (SKINTOKENS_INPUT_* env vars, see src/rig_package/glb_io/limits.py), never
@@ -103,9 +109,13 @@ class GenParams(BaseModel):
     """What a request may choose. Decoding itself is fixed (greedy, one beam),
     so the outputs are a function of the input, ``seed`` and ``num_samples``:
     sample ``i`` is decoded from a point cloud drawn under a seed derived from
-    ``(seed, i)`` (see :mod:`src.data.seeding`)."""
+    ``(seed, i)`` (see :mod:`src.data.seeding`).
+
+    ``output`` is the result format: ``"rig"`` (a rig payload, the default) or
+    ``"glb"``. The server refuses formats not in :data:`OUTPUT_FORMATS`."""
     num_samples: int = Field(default=1, ge=1, le=MAX_NUM_SAMPLES)
     seed: int | None = Field(default=None, ge=0, le=MAX_SEED)
+    output: Literal["rig", "glb"] = "rig"
 
     def with_seed(self) -> "GenParams":
         """These parameters with a seed: the requested one, else a random one."""

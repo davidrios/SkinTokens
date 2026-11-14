@@ -44,6 +44,8 @@ class Primitive:
     # (f, 3) triangle indices local to this primitive, winding already corrected
     # for mirrored node transforms
     faces: np.ndarray
+    # position in the glTF mesh's ``primitives`` list (skipped ones leave gaps)
+    index: int = 0
 
 
 @dataclass
@@ -128,10 +130,10 @@ class Scene:
                 k += 1
             used_names.add(name)
             inst = MeshInstance(node=i, name=name, mesh=node['mesh'], skin=skin, world=world)
-            for prim in data['meshes'][node['mesh']]['primitives']:
+            for prim_index, prim in enumerate(data['meshes'][node['mesh']]['primitives']):
                 # Skip points and lines before reading any accessor metadata/data.
                 if _is_triangle_primitive(prim):
-                    parsed = self._primitive(prim, world)
+                    parsed = self._primitive(prim, world, prim_index)
                     if len(parsed.faces):
                         inst.primitives.append(parsed)
             if inst.primitives:
@@ -174,7 +176,7 @@ class Scene:
             check_limit(vertices, limits.max_vertices, 'vertex count')
             check_limit(faces, limits.max_faces, 'triangle count')
 
-    def _primitive(self, prim: dict, world: np.ndarray) -> Primitive:
+    def _primitive(self, prim: dict, world: np.ndarray, index: int = 0) -> Primitive:
         if 'KHR_draco_mesh_compression' in prim.get('extensions', {}):
             raise ValueError('KHR_draco_mesh_compression meshes are not supported; '
                              'export the GLB without Draco compression')
@@ -194,7 +196,7 @@ class Scene:
         faces = _triangulate(idx, mode)
         if np.linalg.det(world[:3, :3]) < 0:
             faces = faces[:, [0, 2, 1]]
-        return Primitive(json=prim, positions=positions, faces=faces)
+        return Primitive(json=prim, positions=positions, faces=faces, index=index)
 
     # ------------------------------------------------------------------ #
     # geometry
@@ -351,6 +353,141 @@ def _unit(v: np.ndarray) -> np.ndarray:
     return v / np.where(n > 1e-12, n, 1.)
 
 
+# Influences per vertex a rig may carry; rig payloads decode at most this many.
+MAX_INFLUENCES = 256
+
+
+@dataclass(frozen=True)
+class SkinnedRig:
+    """Everything a skinned GLB adds to its input scene, ready to write.
+
+    It is exactly what :func:`write_skinned_glb` combines with the scene's
+    geometry, so a rig computed on one machine and the same input file on
+    another give the same GLB bytes (see :mod:`.rig_payload`).
+
+    Attributes:
+        joints: (J, 3) float64 bind-pose joint heads in glTF world space (Y-up),
+            before ``offset``.
+        parents: (J,) int64 parent of each joint, -1 for roots.
+        offset: (3,) float64 translation applied to meshes and joints together.
+        ids: (N, K) joint of each influence, K a multiple of 4 and at most
+            :data:`MAX_INFLUENCES`, ``uint8`` (up to 256 joints) or ``uint16``;
+            one row per ``scene.vertices()`` row.
+        weights: (N, K) ``uint16`` normalized weights summing to 65535 per row,
+            or ``float32``.
+    """
+    armature_name: str
+    joint_names: tuple
+    parents: np.ndarray
+    joints: np.ndarray
+    offset: np.ndarray
+    ids: np.ndarray
+    weights: np.ndarray
+
+    @property
+    def normalized_weights(self) -> bool:
+        return self.weights.dtype == np.uint16
+
+    def validate(self, vertex_count: int) -> None:
+        """Raise ``ValueError`` unless this rig can skin ``vertex_count`` vertices."""
+        J = len(self.joints)
+        if (J == 0 or self.joints.shape != (J, 3) or self.parents.shape != (J,)
+                or len(self.joint_names) != J):
+            raise ValueError('Skeleton joints, parents and names must have the same nonzero length')
+        if J > 65536:
+            raise ValueError('Too many joints for a glTF skin')
+        if np.any(self.parents >= J) or np.any(self.parents < -1):
+            raise ValueError('Invalid joint parent index')
+        if not np.any(self.parents < 0):
+            raise ValueError('Skeleton has no root joint')
+        if self.offset.shape != (3,):
+            raise ValueError('Rig offset must be a 3-vector')
+        if not (np.all(np.isfinite(self.joints)) and np.all(np.isfinite(self.offset))):
+            raise ValueError('Rig joints and offset must be finite')
+        if (self.ids.ndim != 2 or self.ids.shape != self.weights.shape
+                or self.ids.shape[1] == 0 or self.ids.shape[1] % 4):
+            raise ValueError('Rig influences must be (N, K) with K a nonzero multiple of 4')
+        if self.ids.shape[1] > MAX_INFLUENCES:
+            raise ValueError(f'Rig has {self.ids.shape[1]} influences per vertex; '
+                             f'at most {MAX_INFLUENCES} are supported')
+        if len(self.ids) != vertex_count:
+            raise ValueError(f'Rig of {len(self.ids)} vertices does not match {vertex_count} vertices')
+        if self.ids.dtype != (np.uint8 if J <= 256 else np.uint16):
+            raise ValueError('Rig joint indices have the wrong integer type for the joint count')
+        if self.weights.dtype not in (np.uint16, np.float32):
+            raise ValueError('Rig weights must be uint16 (normalized) or float32')
+        if self.ids.size and int(self.ids.max()) >= J:
+            raise ValueError('Rig joint index out of range')
+        if self.weights.dtype == np.float32 and not np.all(np.isfinite(self.weights)):
+            raise ValueError('Rig weights must be finite')
+
+
+def prepare_skinned_rig(
+    scene: Scene,
+    joints: np.ndarray,
+    parents: Sequence[int],
+    joint_names: Sequence[str],
+    skin,
+    *,
+    group_per_vertex: int = 4,
+    normalize: bool = True,
+    weight_bits: int = 16,
+    offset: Optional[np.ndarray] = None,
+    armature_name: str = 'Armature',
+) -> SkinnedRig:
+    """The :class:`SkinnedRig` that :func:`export_skinned_glb` writes for these
+    arguments (same meaning): influences selected, normalized and quantized."""
+    with malformed_as_value_error(scene.document.path.name):
+        return _prepare_skinned_rig(scene, joints, parents, joint_names, skin,
+                                    group_per_vertex=group_per_vertex, normalize=normalize,
+                                    weight_bits=weight_bits, offset=offset,
+                                    armature_name=armature_name)
+
+
+def _prepare_skinned_rig(scene, joints, parents, joint_names, skin, *,
+                         group_per_vertex, normalize, weight_bits, offset, armature_name):
+    if weight_bits not in (16, 32):
+        raise ValueError('weight_bits must be 16 or 32')
+    joints = np.asarray(joints, dtype=np.float64)
+    parents = np.asarray(parents, dtype=np.int64)
+    J = len(joints)
+    if J == 0 or parents.shape != (J,) or len(joint_names) != J:
+        raise ValueError('Skeleton joints, parents and names must have the same nonzero length')
+    if isinstance(skin, SparseSkin):
+        if len(skin) != scene.vertex_count or skin.ids.shape != skin.weights.shape:
+            raise ValueError(f'Sparse skin of {len(skin)} rows does not match {scene.vertex_count} vertices')
+        if skin.ids.size and (skin.ids.min() < 0 or skin.ids.max() >= J):
+            raise ValueError('Sparse skin joint index out of range')
+    elif skin.shape != (scene.vertex_count, J):
+        raise ValueError(f'Skin shape {skin.shape} does not match ({scene.vertex_count}, {J})')
+    if np.any(parents >= J) or np.any(parents < -1):
+        raise ValueError('Invalid joint parent index')
+    roots = np.flatnonzero(parents < 0)
+    if not len(roots):
+        raise ValueError('Skeleton has no root joint')
+    if J > 65536:
+        raise ValueError('Too many joints for a glTF skin')
+    fallback = int(roots[0])
+    if isinstance(skin, SparseSkin):
+        k = skin.ids.shape[1]
+        if group_per_vertex is not None and group_per_vertex > 0:
+            k = min(k, group_per_vertex)
+        ids, weights = _finish_sparse(skin.ids[:, :k], skin.weights[:, :k], fallback, normalize)
+    else:
+        ids, weights = _sparsify(skin, group_per_vertex, fallback, normalize)
+    weights = (_quantize_weights(weights) if normalize and weight_bits != 32
+               else weights.astype(np.float32))
+    return SkinnedRig(
+        armature_name=str(armature_name),
+        joint_names=tuple(str(n) for n in joint_names),
+        parents=parents,
+        joints=joints,
+        offset=np.zeros(3) if offset is None else np.asarray(offset, dtype=np.float64),
+        ids=ids.astype(np.uint8 if J <= 256 else np.uint16),
+        weights=weights,
+    )
+
+
 def export_skinned_glb(
     scene: Scene,
     filepath,
@@ -381,65 +518,45 @@ def export_skinned_glb(
     tangents, morph targets, extensions, previous skins, animations, cameras
     and lights are not exported.
     """
+    rig = prepare_skinned_rig(scene, joints, parents, joint_names, skin,
+                              group_per_vertex=group_per_vertex, normalize=normalize,
+                              weight_bits=weight_bits, offset=offset, armature_name=armature_name)
+    write_skinned_glb(scene, filepath, rig)
+
+
+def write_skinned_glb(scene: Scene, filepath, rig: SkinnedRig) -> None:
+    """Write ``scene``'s meshes skinned by ``rig`` (from :func:`prepare_skinned_rig`
+    or a decoded rig payload) as one GLB, to a path or a writable binary stream."""
+    rig.validate(scene.vertex_count)
     with malformed_as_value_error(scene.document.path.name):
-        _export_skinned_glb(scene, filepath, joints, parents, joint_names, skin,
-                            group_per_vertex=group_per_vertex, normalize=normalize,
-                            weight_bits=weight_bits, offset=offset, armature_name=armature_name)
+        _write_skinned_glb(scene, filepath, rig)
 
 
-def _export_skinned_glb(scene, filepath, joints, parents, joint_names, skin, *,
-                        group_per_vertex, normalize, weight_bits, offset, armature_name):
-    if weight_bits not in (16, 32):
-        raise ValueError('weight_bits must be 16 or 32')
+def _write_skinned_glb(scene, filepath, rig: SkinnedRig):
     document = scene.document
-    joints = np.asarray(joints, dtype=np.float64)
-    parents = np.asarray(parents, dtype=np.int64)
-    J = len(joints)
-    if J == 0 or parents.shape != (J,) or len(joint_names) != J:
-        raise ValueError('Skeleton joints, parents and names must have the same nonzero length')
-    if isinstance(skin, SparseSkin):
-        if len(skin) != scene.vertex_count or skin.ids.shape != skin.weights.shape:
-            raise ValueError(f'Sparse skin of {len(skin)} rows does not match {scene.vertex_count} vertices')
-        if skin.ids.size and (skin.ids.min() < 0 or skin.ids.max() >= J):
-            raise ValueError('Sparse skin joint index out of range')
-    elif skin.shape != (scene.vertex_count, J):
-        raise ValueError(f'Skin shape {skin.shape} does not match ({scene.vertex_count}, {J})')
-    if np.any(parents >= J) or np.any(parents < -1):
-        raise ValueError('Invalid joint parent index')
-    shift = np.zeros(3) if offset is None else np.asarray(offset, dtype=np.float64)
-    heads = joints + shift
+    parents = rig.parents
+    J = len(rig.joints)
+    shift = rig.offset
+    heads = rig.joints + shift
+    ids_all, weights_all = rig.ids, rig.weights
+    integer_weights = rig.normalized_weights
+    armature_name = rig.armature_name
 
     builder = Builder()
     data, nodes = builder.data, builder.data['nodes']
 
     # Armature wrapper + joints: joint j is node 1 + j.
     roots = [int(j) for j in np.flatnonzero(parents < 0)]
-    if not roots:
-        raise ValueError('Skeleton has no root joint')
     nodes.append({'name': armature_name, 'children': [1 + j for j in roots]})
     for j in range(J):
         p = int(parents[j])
         local = heads[j] - (heads[p] if p >= 0 else 0.)
-        nodes.append({'name': str(joint_names[j]), 'translation': local.tolist(),
+        nodes.append({'name': rig.joint_names[j], 'translation': local.tolist(),
                       'children': [1 + int(c) for c in np.flatnonzero(parents == j)]})
     ibm = np.broadcast_to(np.eye(4), (J, 4, 4)).copy()
     ibm[:, :3, 3] = -heads
     data['skins'] = [{'name': armature_name, 'skeleton': 0, 'joints': list(range(1, J + 1)),
                       'inverseBindMatrices': builder.accessor(ibm.transpose(0, 2, 1).reshape(J, 16), 'MAT4')}]
-    fallback = roots[0]
-    if isinstance(skin, SparseSkin):
-        k = skin.ids.shape[1]
-        if group_per_vertex is not None and group_per_vertex > 0:
-            k = min(k, group_per_vertex)
-        ids_all, weights_all = _finish_sparse(skin.ids[:, :k], skin.weights[:, :k], fallback, normalize)
-    else:
-        ids_all, weights_all = _sparsify(skin, group_per_vertex, fallback, normalize)
-    joint_component = np.uint8 if J <= 256 else np.uint16
-    if J > 65536:
-        raise ValueError('Too many joints for a glTF skin')
-    integer_weights = normalize and weight_bits != 32
-    weights_all = (_quantize_weights(weights_all) if integer_weights
-                   else weights_all.astype(np.float32))
 
     scene_nodes = [0]
     meshes = []
@@ -467,7 +584,7 @@ def _export_skinned_glb(scene, filepath, joints, parents, joint_names, skin, *,
             sl = slice(vertex_offset, vertex_offset + n)
             for s in range(ids_all.shape[1] // 4):
                 cols = slice(4 * s, 4 * s + 4)
-                attrs[f'JOINTS_{s}'] = _write_attribute(builder, ids_all[sl, cols].astype(joint_component))
+                attrs[f'JOINTS_{s}'] = _write_attribute(builder, ids_all[sl, cols])
                 attrs[f'WEIGHTS_{s}'] = _write_attribute(builder, weights_all[sl, cols],
                                                         normalized=integer_weights)
             vertex_offset += n

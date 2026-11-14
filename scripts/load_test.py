@@ -57,7 +57,7 @@ class RequestResult:
     # Time from submit until inference started on it (the first progress
     # message at 10% or more), i.e. how long it waited for the GPU.
     queue_sec: float | None = None
-    glb_bytes: int = 0
+    output_bytes: int = 0
     error: str | None = None
 
 
@@ -89,14 +89,16 @@ def _stats(values: list[float]) -> dict:
             "p95": round(pct(0.95), 2), "max": round(ordered[-1], 2), "min": round(ordered[0], 2)}
 
 
-async def _one_request(ws_url: str, index: int, name: str, data: bytes) -> RequestResult:
+async def _one_request(ws_url: str, index: int, name: str, data: bytes,
+                       output: str = "rig") -> RequestResult:
     import websockets
 
     started = time.monotonic()
     queue_sec = None
     async with websockets.connect(ws_url, max_size=None, open_timeout=30) as ws:
         try:
-            await ws.send(json.dumps({"filename": Path(name).name, "seed": index}))
+            await ws.send(json.dumps({"filename": Path(name).name, "seed": index,
+                                      "output": output}))
             await ws.send(data)
             while True:
                 message = await ws.recv()
@@ -107,8 +109,8 @@ async def _one_request(ws_url: str, index: int, name: str, data: bytes) -> Reque
                 if stage == "processing" and queue_sec is None and event.get("progress", 0) >= 10:
                     queue_sec = time.monotonic() - started
                 elif stage == "done":
-                    glb = await ws.recv()
-                    size = len(glb) if isinstance(glb, bytes) else 0
+                    result = await ws.recv()
+                    size = len(result) if isinstance(result, bytes) else 0
                     if event.get("sample_index", 0) + 1 >= event.get("num_samples", 1):
                         return RequestResult(index, name, True, time.monotonic() - started,
                                              queue_sec, size)
@@ -136,7 +138,7 @@ async def _health(server: str) -> dict | None:
 
 
 async def run(server: str, concurrency: int, duration: float, deadline: float,
-              inputs: list[str]) -> tuple[Summary, list[RequestResult]]:
+              inputs: list[str], output: str = "rig") -> tuple[Summary, list[RequestResult]]:
     ws_url = _websocket_url(server)
     payloads = [(path, Path(path).read_bytes()) for path in inputs]
     counter = itertools.count()
@@ -152,7 +154,7 @@ async def run(server: str, concurrency: int, duration: float, deadline: float,
             index = next(counter)
             name, data = payloads[index % len(payloads)]
             try:
-                result = await _one_request(ws_url, index, name, data)
+                result = await _one_request(ws_url, index, name, data, output)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -227,6 +229,8 @@ def main() -> None:
                         help=f"hard end of the run in seconds (max {HARD_LIMIT_SEC:.0f})")
     parser.add_argument("--input", action="append", dest="inputs",
                         help="input file; repeat to rotate (default: the mesh-only examples)")
+    parser.add_argument("--output-format", choices=("rig", "glb"), default="rig",
+                        help="result format to request (glb needs SKINTOKENS_ENABLE_GLB_OUTPUT=1)")
     parser.add_argument("--json", help="write the summary and per-request results here")
     parser.add_argument("--compare", nargs="+", metavar="JSON",
                         help="print a comparison of earlier --json summaries and exit")
@@ -241,7 +245,7 @@ def main() -> None:
     duration = min(args.duration, deadline)
 
     summary, results = asyncio.run(run(args.server, args.concurrency, duration, deadline,
-                                       args.inputs or DEFAULT_INPUTS))
+                                       args.inputs or DEFAULT_INPUTS, args.output_format))
     _print_summary(summary)
     if args.json:
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)

@@ -8,9 +8,11 @@ a time, so up to ``SKINTOKENS_WORKERS`` requests are parsed, sampled on the GPU
 and exported fully in parallel. Further requests wait for a free worker in
 FIFO order and get a once-per-second queue heartbeat meanwhile.
 
-Clients submit a 3D file (GLB/GLTF) and receive a rigged GLB over WebSocket.
-See ``src/server/pipeline.py`` for the model side (and a note on why results
-are non-deterministic).
+Clients submit a 3D file (GLB/GLTF) and receive, over WebSocket, a rig payload
+(skeleton and skin only; the client adds it to the file it uploaded, see
+``src/rig_package/glb_io/rig_payload.py``) or, if enabled, the whole rigged
+GLB. See ``src/server/pipeline.py`` for the model side (and a note on why
+results are non-deterministic).
 
 Run:
     python serve.py --host 0.0.0.0 --port 8087
@@ -20,6 +22,8 @@ Environment variables:
     SKINTOKENS_MODEL_CKPT     Path to the model checkpoint
     SKINTOKENS_HF_PATH        Optional HuggingFace model path
     SKINTOKENS_DEVICE         Device override (default: cuda if available)
+    SKINTOKENS_ENABLE_GLB_OUTPUT  1 to also serve "output": "glb" (whole GLBs,
+                              several times larger); default: rig payloads only
     SKINTOKENS_MAX_QUEUE      Requests that may wait for a worker (default 16);
                               more are refused with "server busy"
     SKINTOKENS_HEADER_TIMEOUT_SEC / SKINTOKENS_UPLOAD_TIMEOUT_SEC
@@ -140,6 +144,14 @@ def _request_filename(req: dict) -> str:
     return filename
 
 
+def _unsupported_output_message(output: str) -> str:
+    supported = ", ".join(f'"{f}"' for f in config.OUTPUT_FORMATS)
+    message = f'output "{output}" is not supported by this server; supported: {supported}'
+    if output == "glb":
+        message += ' (send "output": "rig" and add the rig to the upload on the client)'
+    return message
+
+
 def _admission_limit() -> int:
     return config.WORKERS + config.MAX_QUEUE
 
@@ -181,7 +193,8 @@ async def _generate(
     waits for a worker.
 
     Returns:
-        List of (glb_bytes, meta_dict) tuples, one per sample (meta is empty).
+        List of (payload_bytes, meta_dict) tuples, one per sample (meta is
+        empty): rig payloads or GLBs, as ``params.output`` asks.
     """
     cancellation = cancellation or CancellationToken()
     suffix = _validate_upload(file_data, filename)
@@ -203,7 +216,7 @@ async def _generate(
 
     state.active_jobs += 1
     try:
-        glbs = await state.pool.submit(
+        outputs = await state.pool.submit(
             {**params.model_dump(), "suffix": suffix, "request_id": request_id},
             file_data,
             on_start=on_start,
@@ -217,7 +230,7 @@ async def _generate(
         raise GenerationCancelled(cancellation.reason) from None
     finally:
         state.active_jobs -= 1
-    return [(glb, {}) for glb in glbs]
+    return [(output, {}) for output in outputs]
 
 
 async def _watch_ws_cancellation(ws: WebSocket, cancellation: CancellationToken,
@@ -322,6 +335,7 @@ async def health():
         "workers": pool["workers"],
         "pool": pool,
         "queue_depth": pool["queued"],
+        "output_formats": list(config.OUTPUT_FORMATS),
     }
 
 
@@ -365,6 +379,7 @@ class _RequestRecord:
         self.upload: Optional[bytes] = None  # kept for a dump; released on success
         self.upload_bytes: Optional[int] = None
         self.samples: Optional[int] = None
+        self.output_bytes: Optional[int] = None
         self.trace = RequestTrace()
         self._trace_token = bind_trace(self.trace)
 
@@ -422,6 +437,8 @@ class _RequestRecord:
                                                 separators=(",", ":"), default=str))
         if self.samples is not None:
             parts.append(f"samples={self.samples}")
+        if self.output_bytes is not None:
+            parts.append(f"output_bytes={self.output_bytes}")
         if self.error:
             parts.append("error=" + json.dumps(self.error, ensure_ascii=False))
         if self.dump_error:
@@ -455,12 +472,15 @@ class _RequestRecord:
 async def ws_generate(ws: WebSocket):
     """
     WebSocket protocol:
-      client -> {"filename": "model.glb", ...params}
+      client -> {"filename": "model.glb", "output": "rig"|"glb", ...params}
       client -> <binary: file data>
       client -> {"type": "cancel"}
       server -> {"stage": "queued"|"processing"|"done"|"cancelled"|"error", ...}
-      server -> {"stage": "done", "glb_size": N, ...}
-      server -> <binary: GLB data>
+      server -> {"stage": "done", "format": "rig"|"glb", "payload_size": N, ...}
+      server -> <binary: rig payload or GLB>
+
+    ``output`` defaults to ``"rig"``; formats outside ``config.OUTPUT_FORMATS``
+    (``"glb"`` unless SKINTOKENS_ENABLE_GLB_OUTPUT=1) are refused before the upload.
     """
     request_id = new_request_id()
     record = _RequestRecord(request_id, ws.client)
@@ -508,6 +528,9 @@ async def ws_generate(ws: WebSocket):
         # with the result and the run reproduced.
         params = GenParams(**{k: v for k, v in req.items() if k in GenParams.model_fields}).with_seed()
         record.params = params.model_dump()
+        if params.output not in config.OUTPUT_FORMATS:
+            await reject(_unsupported_output_message(params.output))
+            return
 
         # Every admitted request holds its upload in this process until a
         # worker takes it, so their number is capped.
@@ -582,10 +605,10 @@ async def ws_generate(ws: WebSocket):
         with suppress(asyncio.CancelledError):
             await receiver_task
 
-        results = await generation_task  # list of (glb, meta) tuples
+        results = await generation_task  # list of (payload, meta) tuples
         await outbox.flush()
 
-        for sample_idx, (glb, _meta) in enumerate(results):
+        for sample_idx, (payload, _meta) in enumerate(results):
             await ws.send_json({
                 "stage": "done",
                 "sample_index": sample_idx,
@@ -594,9 +617,11 @@ async def ws_generate(ws: WebSocket):
                 "elapsed_sec": round(time.time() - t0, 2),
                 "progress": 100,
                 "request_id": request_id,
-                "glb_size": len(glb),
+                "format": params.output,
+                "payload_size": len(payload),
             })
-            await ws.send_bytes(glb)
+            await ws.send_bytes(payload)
+            record.output_bytes = (record.output_bytes or 0) + len(payload)
 
         record.samples = len(results)
         record.status = "done"

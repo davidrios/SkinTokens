@@ -20,6 +20,9 @@ services:
       SKINTOKENS_WORKERS: ${SKINTOKENS_WORKERS:-2}
       SKINTOKENS_MAX_NUM_SAMPLES: ${SKINTOKENS_MAX_NUM_SAMPLES:-1}
       SKINTOKENS_MAX_NEW_TOKENS: 2048
+      # Results are rig payloads (skeleton + skin; clients add them to the file
+      # they uploaded). Set to 1 to also serve "output": "glb" (whole GLBs).
+      SKINTOKENS_ENABLE_GLB_OUTPUT: ${SKINTOKENS_ENABLE_GLB_OUTPUT:-0}
       # Requests allowed to wait for a worker beyond the ones running; each
       # holds its upload in the gateway, so this bounds gateway memory to
       # about (SKINTOKENS_WORKERS + SKINTOKENS_MAX_QUEUE) * SKINTOKENS_MAX_UPLOAD_MB.
