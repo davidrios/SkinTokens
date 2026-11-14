@@ -9,8 +9,8 @@ also appended to ``$SKINTOKENS_OUTPUT_ROOT/logs/skintokens-YYYY-MM-DD.log``, nam
 the local date. The file only switches at a line boundary, so no line is split
 across two days.
 
-SIGTERM and SIGINT are forwarded to the command's process group, so
-``docker stop`` still shuts the server down gracefully; the wrapper exits with
+SIGTERM and SIGINT are forwarded only to the command, which owns the shutdown
+of its workers and their resources; the wrapper exits with
 the command's exit code. Archiving never stops the command: if the log
 directory cannot be written, the wrapper says so once on stderr and carries on.
 """
@@ -139,17 +139,16 @@ def run(command: Sequence[str], archive: DailyLog, *,
     posix = os.name == "posix"
     process = subprocess.Popen(
         list(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        # Its own process group, so a forwarded signal also reaches the
-        # children of a shell command (the asset sync before the server).
+        # Isolate the command and its children from terminal signals sent to
+        # the wrapper's group. The command coordinates its workers' shutdown.
         start_new_session=posix,
     )
 
     def forward(signum, _frame) -> None:
         try:
-            if posix:
-                os.killpg(process.pid, signum)
-            else:
-                process.send_signal(signum)
+            # Signalling the whole group kills model/compile workers before
+            # the gateway can stop them and unlink their named semaphores.
+            process.send_signal(signum)
         except OSError:
             pass  # Already gone.
 

@@ -40,6 +40,20 @@ def _run(params, upload, cancellation, progress):
 ECHO = ServiceSpec("echo", _load, _run)
 
 
+def _load_resources(options):
+    import multiprocessing
+
+    # Keep named semaphores alive until normal process teardown. A worker
+    # killed by group-wide SIGTERM cannot run their unlink finalizers.
+    global _resources
+    ctx = multiprocessing.get_context("spawn")
+    _resources = [ctx.Semaphore(1), ctx.Semaphore(1)]
+    return _load(options)
+
+
+RESOURCES = ServiceSpec("resources", _load_resources, _run)
+
+
 def _idle():
     """Housekeeping that runs after the reply: slow, then leaves a marker."""
     time.sleep(0.5)

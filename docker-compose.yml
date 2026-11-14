@@ -8,6 +8,9 @@ services:
     image: skintokens:cu128-torch2.11.0
     container_name: skintokens
     restart: unless-stopped
+    # Allow the gateway to drain requests and close its worker pool (30s,
+    # plus termination fallback) before Docker resorts to SIGKILL.
+    stop_grace_period: 60s
     # All host GPUs: the worker pool pins its workers to the cards
     # round-robin (SKINTOKENS_WORKERS per GPU).
     gpus: all
