@@ -27,6 +27,12 @@ services:
       # Time a client has to send its header / its whole upload, in seconds.
       SKINTOKENS_HEADER_TIMEOUT_SEC: ${SKINTOKENS_HEADER_TIMEOUT_SEC:-30}
       SKINTOKENS_UPLOAD_TIMEOUT_SEC: ${SKINTOKENS_UPLOAD_TIMEOUT_SEC:-300}
+      # Logs: one line per request at INFO (SKINTOKENS_LOG_LEVEL=DEBUG for stage
+      # details), archived daily to <output root>/logs/skintokens-YYYY-MM-DD.log;
+      # failed requests leave <output root>/dump/<date>/<request_id>/.
+      # Copy out with: docker compose cp skintokens:/data/outputs/dump/<date>/<request_id> .
+      SKINTOKENS_OUTPUT_ROOT: /data/outputs
+      SKINTOKENS_LOG_LEVEL: ${SKINTOKENS_LOG_LEVEL:-INFO}
       SKINTOKENS_USE_CACHE: 1
       SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE: 1
       SKINTOKENS_FAST_DECODE: 1
@@ -38,11 +44,13 @@ services:
       SKINTOKENS_INPUT_MAX_FACES: ${SKINTOKENS_INPUT_MAX_FACES:-1000000}
       SKINTOKENS_INPUT_MAX_MESH_INSTANCES: ${SKINTOKENS_INPUT_MAX_MESH_INSTANCES:-128}
       SKINTOKENS_INPUT_MAX_PRIMITIVES: ${SKINTOKENS_INPUT_MAX_PRIMITIVES:-256}
+    volumes:
+      - skintokens-outputs:/data/outputs
     working_dir: /workspace/SkinTokens
     ports:
       - "8087:8000"
     shm_size: 1gb
-    command: ["python", "serve.py"]
+    command: ["python", "-m", "src.server.log_archive", "python", "serve.py"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
@@ -58,6 +66,9 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+volumes:
+  skintokens-outputs:
 
 networks:
   ai-shared:

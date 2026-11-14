@@ -369,7 +369,7 @@ def run_inference(batch: dict, params: GenParams, request_id: str,
     if fast_decode:
         _set_llm_attention(state.model, _FAST_ATTN_IMPL)
         generate_kwargs.update(cache_implementation="static", compile_config=compile_config)
-        logger.info("[%s] fast decode enabled (%s attention + static cache + %s)",
+        logger.debug("[%s] fast decode enabled (%s attention + static cache + %s)",
                     request_id, decode_attention.DECODE_ATTN_MODE, config.FAST_DECODE_BACKEND)
     elif config.FAST_DECODE:
         # Fast decode was requested but is unavailable; the prewarm may have
@@ -462,7 +462,7 @@ def export_samples(preds: list, params: GenParams, request_id: str,
         # sampled points, it is merged there, on far fewer rows.
         collapsed_joints = asset.collapse_near_parent_joints()
         if collapsed_joints:
-            logger.info("[%s] sample=%d collapsed near-parent skeleton joints: %s",
+            logger.debug("[%s] sample=%d collapsed near-parent skeleton joints: %s",
                         request_id, sample_idx, ", ".join(collapsed_joints))
 
         skin = None
@@ -507,7 +507,7 @@ class ProgressReporter:
         now = time.monotonic()
         elapsed = round(now - self.started_at, 2)
         if not stage.startswith(self.LOG_SKIPPED_PREFIXES):
-            logger.info("[%s] progress=%d%% stage=%s elapsed=%.2fs delta=%.2fs",
+            logger.debug("[%s] progress=%d%% stage=%s elapsed=%.2fs delta=%.2fs",
                         self.request_id, percent, stage, elapsed, now - self.last_logged_at)
             self.last_logged_at = now
         if self.send is not None:
@@ -529,7 +529,7 @@ def run_job(params: dict, upload: bytes, cancellation: Cancellation, progress=No
     suffix = params.pop("suffix")
     request_id = params.pop("request_id", "-")
     gen = GenParams(**params).with_seed()
-    logger.info("[%s] seed=%d num_samples=%d", request_id, gen.seed, gen.num_samples)
+    logger.debug("[%s] seed=%d num_samples=%d", request_id, gen.seed, gen.num_samples)
     reporter = ProgressReporter(request_id, cancellation, progress)
 
     # Parsed straight from memory. The client's filename is used for nothing:

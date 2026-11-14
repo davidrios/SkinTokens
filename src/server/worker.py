@@ -30,8 +30,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-LOG_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)s %(name)s [%(processName)s] - %(message)s"
-LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+from src.server.logs import configure_logging
 
 ProgressCallback = Callable[[dict], None]
 
@@ -157,18 +156,6 @@ class _Inbox:
             self._tokens.pop(job_id, None)
 
 
-def _configure_logging() -> None:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
-    for name in ("skintokens.serve", "skintokens.worker"):
-        log = logging.getLogger(name)
-        for old in list(log.handlers):
-            log.removeHandler(old)
-        log.addHandler(handler)
-        log.setLevel(logging.INFO)
-        log.propagate = False
-
-
 def main(spec_reference: str, jobs, events, options: dict) -> None:
     """Process entry point. *jobs* is read, *events* written."""
     # Ctrl+C in a terminal reaches the whole process group; the gateway decides
@@ -180,7 +167,7 @@ def main(spec_reference: str, jobs, events, options: dict) -> None:
     if threads:
         for variable in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
             os.environ.setdefault(variable, str(threads))
-    _configure_logging()
+    configure_logging()
     log = logging.getLogger("skintokens.worker")
     sender = _Sender(events)
 

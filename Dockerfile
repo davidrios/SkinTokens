@@ -37,4 +37,4 @@ COPY src ./src
 
 EXPOSE 8000
 
-CMD ["python", "serve.py"]
+CMD ["python", "-m", "src.server.log_archive", "python", "serve.py"]

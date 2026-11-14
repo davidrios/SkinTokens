@@ -37,20 +37,17 @@ import os
 import asyncio
 import logging
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Optional
 
-LOG_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)s %(name)s - %(message)s"
-LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+from src.server.logs import (LOG_DATE_FORMAT, RequestTrace, bind_trace, configure_logging,
+                             save_request_dump, unbind_trace)
+
+configure_logging()
 logger = logging.getLogger("skintokens.serve")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
-    logger.addHandler(handler)
-logger.setLevel(logging.INFO)
-logger.propagate = False
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -182,12 +179,12 @@ async def _generate(
     if state.pool is None:
         raise RuntimeError("model still loading")
 
-    logger.info("[%s] submitted queued=%s filename=%r", request_id,
+    logger.debug("[%s] submitted queued=%s filename=%r", request_id,
                 state.pool.would_queue(), filename)
     wait_started = time.monotonic()
 
     async def on_start():
-        logger.info("[%s] worker acquired after %.2fs", request_id,
+        logger.debug("[%s] worker acquired after %.2fs", request_id,
                     time.monotonic() - wait_started)
 
     def on_progress(event: dict):
@@ -221,16 +218,16 @@ async def _watch_ws_cancellation(ws: WebSocket, cancellation: CancellationToken,
             try:
                 message = _parse_text_message(await ws.receive_text())
             except (ValueError, KeyError):  # KeyError: a binary frame
-                logger.warning("[%s] ignoring invalid WebSocket message", request_id)
+                logger.debug("[%s] ignoring invalid WebSocket message", request_id)
                 continue
             message_type = message.get("type", message.get("action", ""))
             if str(message_type).lower() in {"cancel", "interrupt"}:
-                logger.info("[%s] explicit cancellation requested", request_id)
+                logger.debug("[%s] explicit cancellation requested", request_id)
                 cancellation.cancel("client requested cancellation")
                 return True
-            logger.warning("[%s] ignoring WebSocket message type=%r", request_id, message_type)
+            logger.debug("[%s] ignoring WebSocket message type=%r", request_id, message_type)
     except WebSocketDisconnect:
-        logger.warning("[%s] WebSocket disconnected; cancelling generation", request_id)
+        logger.debug("[%s] WebSocket disconnected; cancelling generation", request_id)
         cancellation.cancel("WebSocket client disconnected")
         return False
     except RuntimeError:
@@ -318,6 +315,100 @@ async def health():
     }
 
 
+# Errors caused by the request itself (bad parameters or upload, a client that
+# went away): logged as warnings; anything else as an error.
+_CLIENT_ERRORS = (ValueError, WebSocketDisconnect)
+
+
+class _RequestRecord:
+    """One request's details: the source of its single summary log line and,
+    when the server fails on it, of its dump (``dump/<date>/<request_id>/``: upload as
+    received, header frame, traceback and trace). Create it in the request's
+    handler task so the trace also collects the DEBUG lines of tasks it starts.
+    """
+
+    def __init__(self, request_id: str, client) -> None:
+        self.request_id = request_id
+        self.client = client
+        self.started = time.monotonic()
+        self.status = "started"
+        self.error: Optional[str] = None
+        self.server_error = False
+        self.traceback: Optional[str] = None
+        self.raw_header: Optional[str] = None
+        self.header_valid = False
+        self.filename: Optional[str] = None
+        self.params: Optional[dict] = None
+        self.upload: Optional[bytes] = None  # kept for a dump; released on success
+        self.upload_bytes: Optional[int] = None
+        self.samples: Optional[int] = None
+        self.trace = RequestTrace()
+        self._trace_token = bind_trace(self.trace)
+
+    def fail(self, exc: BaseException) -> None:
+        self.status = "error"
+        self.error = f"{type(exc).__name__}: {exc}"
+        self.server_error = not isinstance(exc, _CLIENT_ERRORS)
+        self.traceback = "".join(traceback.format_exception(exc))
+
+    def reject(self, message: str) -> None:
+        """A request refused with an error frame (busy, loading, malformed,
+        timed out): a ``rejected`` warning line, never a dump."""
+        self.status = "rejected"
+        self.error = message
+
+    def dump_files(self) -> dict[str, bytes]:
+        files: dict[str, bytes] = {}
+        if self.upload is not None:
+            suffix = Path(str(self.filename or "")).suffix.lower()
+            files["input" + (suffix if suffix in SUPPORTED_EXT else ".bin")] = self.upload
+        if self.raw_header is not None:
+            files["params.json" if self.header_valid else "params.txt"] = self.raw_header.encode("utf-8")
+        files["traceback.txt"] = (self.traceback or self.error or "").encode("utf-8")
+        files["trace.log"] = self.trace.text().encode("utf-8")
+        return files
+
+    def log_line(self, elapsed: float) -> tuple[int, str]:
+        parts = [f"[{self.request_id}]", "generate", f"status={self.status}",
+                 f"elapsed={elapsed:.2f}s", f"client={self.client}"]
+        if self.filename is not None:
+            parts.append(f"filename={self.filename!r}")
+        if self.upload_bytes is not None:
+            parts.append(f"bytes={self.upload_bytes}")
+        if self.params is not None:
+            parts.append("params=" + json.dumps(self.params, ensure_ascii=False,
+                                                separators=(",", ":"), default=str))
+        if self.samples is not None:
+            parts.append(f"samples={self.samples}")
+        if self.error:
+            parts.append("error=" + json.dumps(self.error, ensure_ascii=False))
+        if self.dump_error:
+            parts.append("dump_error=" + json.dumps(self.dump_error, ensure_ascii=False))
+        if self.status == "done":
+            level = logging.INFO
+        elif self.status == "error" and self.server_error:
+            level = logging.ERROR
+        else:
+            level = logging.WARNING
+        return level, " ".join(parts)
+
+    dump_error: Optional[str] = None
+
+    def save(self) -> None:
+        """Write the dump of a failed request, then the single summary line."""
+        unbind_trace(self._trace_token)
+        if self.status == "started":
+            self.status = "incomplete"
+        elapsed = time.monotonic() - self.started
+        if self.status == "error" and self.server_error:  # unhandled server-side failures only
+            try:
+                save_request_dump(self.request_id, self.dump_files())
+            except Exception as exc:  # The dump never fails the request.
+                self.dump_error = f"failed to save request dump: {exc}"
+        self.upload = None
+        logger.log(*self.log_line(elapsed))
+
+
 @app.websocket("/ws/generate")
 async def ws_generate(ws: WebSocket):
     """
@@ -330,16 +421,17 @@ async def ws_generate(ws: WebSocket):
       server -> <binary: GLB data>
     """
     request_id = uuid.uuid4().hex[:8]
+    record = _RequestRecord(request_id, ws.client)
     cancellation = None
     generation_task = None
     receiver_task = None
     outbox = None
 
     await ws.accept()
-    logger.info("[%s] WebSocket connected client=%s", request_id, ws.client)
+    logger.debug("[%s] WebSocket connected client=%s", request_id, ws.client)
 
     async def reject(message: str) -> None:
-        logger.warning("[%s] rejected: %s", request_id, message)
+        record.reject(message)
         await ws.send_json({"stage": "error", "message": message})
         await ws.close()
 
@@ -353,14 +445,17 @@ async def ws_generate(ws: WebSocket):
         except KeyError:  # a binary frame
             await reject("expected a JSON request header before the file")
             return
+        record.raw_header = header
         req = _parse_text_message(header)
-        logger.info("[%s] WebSocket generation request received", request_id)
+        record.header_valid = True
+        logger.debug("[%s] WebSocket generation request received", request_id)
 
         if not state.ready or state.pool is None:
             await reject("model still loading")
             return
 
         filename = _request_filename(req)
+        record.filename = filename
         if req.get("use_skeleton"):
             await reject("use_skeleton is no longer supported; inputs are meshes and "
                          "the skeleton is always generated")
@@ -370,6 +465,7 @@ async def ws_generate(ws: WebSocket):
         # ignored. A request without a seed gets one here, so it can be reported
         # with the result and the run reproduced.
         params = GenParams(**{k: v for k, v in req.items() if k in GenParams.model_fields}).with_seed()
+        record.params = params.model_dump()
 
         # Every admitted request holds its upload in this process until a
         # worker takes it, so their number is capped.
@@ -388,13 +484,16 @@ async def ws_generate(ws: WebSocket):
             await reject("invalid file: expected a binary message")
             return
 
-        logger.info("[%s] file decoded bytes=%d filename=%r params=%s",
+        record.upload = file_data
+        record.upload_bytes = len(file_data)
+        logger.debug("[%s] file decoded bytes=%d filename=%r params=%s",
                     request_id, len(file_data), filename, params.model_dump())
 
         cancellation = CancellationToken()
         outbox = _WsOutbox(ws, cancellation)
 
         def send_progress(percent, stage, elapsed):
+            record.trace.event(f"progress={percent}% stage={stage} elapsed={elapsed}s")
             outbox.post({"stage": "processing", "step": stage, "progress": percent,
                          "elapsed_sec": elapsed, "request_id": request_id})
 
@@ -404,7 +503,7 @@ async def ws_generate(ws: WebSocket):
                          "request_id": request_id})
 
         queued = state.pool.would_queue()
-        logger.info("[%s] queued=%s", request_id, queued)
+        logger.debug("[%s] queued=%s", request_id, queued)
         outbox.post({"stage": "queued", "queued": queued, "request_id": request_id})
         outbox.post({"stage": "processing", "progress": 0, "request_id": request_id})
 
@@ -433,7 +532,8 @@ async def ws_generate(ws: WebSocket):
                 await ws.send_json({"stage": "cancelled", "message": cancellation.reason,
                                     "request_id": request_id})
                 await ws.close()
-            logger.info("[%s] WebSocket generation cancelled: %s", request_id, cancellation.reason)
+            record.status = "cancelled"
+            record.error = cancellation.reason
             return
 
         receiver_task.cancel()
@@ -456,16 +556,17 @@ async def ws_generate(ws: WebSocket):
             })
             await ws.send_bytes(glb)
 
-        logger.info("[%s] WebSocket request completed samples=%d elapsed=%.2fs",
-                    request_id, len(results), time.time() - t0)
+        record.samples = len(results)
+        record.status = "done"
         await ws.close()
 
     except WebSocketDisconnect:
-        logger.warning("[%s] WebSocket disconnected", request_id)
+        record.status = "disconnected"
     except GenerationCancelled as e:
-        logger.info("[%s] WebSocket generation cancelled: %s", request_id, e)
+        record.status = "cancelled"
+        record.error = str(e)
     except Exception as e:
-        logger.exception("[%s] WebSocket generation failed", request_id)
+        record.fail(e)
         try:
             if outbox is not None:
                 await outbox.flush()
@@ -487,6 +588,7 @@ async def ws_generate(ws: WebSocket):
             await outbox.close()
         if admitted:
             state.admitted -= 1
+        record.save()
 
 
 # --------------------------------------------------------------------------- #
@@ -511,11 +613,17 @@ def main():
 
     import uvicorn
 
-    class HealthCheckFilter(logging.Filter):
-        def filter(self, record: logging.LogRecord) -> bool:
-            return '"GET /health' not in record.getMessage()
+    class RequestNoiseFilter(logging.Filter):
+        """Drops uvicorn's per-connection lines: each request logs one summary."""
 
-    logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
+        def filter(self, record: logging.LogRecord) -> bool:
+            message = record.getMessage()
+            return not ('"GET /health' in message
+                        or message.startswith("WebSocket /ws/")
+                        or message in ("connection open", "connection closed"))
+
+    for name in ("uvicorn.access", "uvicorn.error"):
+        logging.getLogger(name).addFilter(RequestNoiseFilter())
 
     log_config = uvicorn.config.LOGGING_CONFIG.copy()
     log_config["formatters"] = {
