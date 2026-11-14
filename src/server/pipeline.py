@@ -415,10 +415,8 @@ def release_memory() -> None:
         return
     state.release_pending = False
     if config.EMPTY_CACHE_AFTER_INFERENCE and torch.cuda.is_available():
-        started = time.perf_counter()
         gc.collect()
         torch.cuda.empty_cache()
-        logger.info("memory released in %.0fms", (time.perf_counter() - started) * 1000)
 
 
 GROUP_PER_VERTEX = 4  # influences per vertex in the exported GLB
