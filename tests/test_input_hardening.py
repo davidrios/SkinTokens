@@ -187,18 +187,25 @@ def test_limits_from_env(monkeypatch):
 
 
 def test_serve_never_uses_client_filename_as_path(monkeypatch):
+    """The gateway passes only the upload's suffix to the worker, which writes
+    it to a fixed name in its own temp directory."""
+    from src.server import pipeline
+    from src.server.worker import Cancellation
+
     seen = []
 
     def fake_prepare(input_path, *args, **kwargs):
         seen.append(Path(input_path))
         raise RuntimeError("stop")
 
-    monkeypatch.setattr(serve, "_prepare_inputs", fake_prepare)
+    monkeypatch.setitem(pipeline.STAGES, "prepare", fake_prepare)
     for name in ("../../escape.glb", "C:/Windows/escape.glb", "/etc/escape.glb", "a/../../b.glb"):
+        suffix = serve._validate_upload(b"data", name)
         with pytest.raises(RuntimeError, match="stop"):
-            asyncio.run(serve._generate(b"data", name, serve.GenParams(), "req"))
+            pipeline.run_job({"suffix": suffix, "request_id": "req"}, b"data", Cancellation())
     assert len(seen) == 4
     assert all(p.name == "input.glb" and p.parent.name.startswith("skintokens_input_") for p in seen)
+    assert not any(p.parent.exists() for p in seen)
 
 
 def test_serve_rejects_oversized_upload(monkeypatch):

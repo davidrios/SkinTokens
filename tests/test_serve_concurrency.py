@@ -1,13 +1,12 @@
-"""Concurrency / parallelism tests for the staged serve pipeline.
+"""Concurrency tests for the multi-process serve pipeline.
 
 Covered guarantees:
-  * I/O stages (parse + export) never run concurrently  -> no shared I/O state
-    pollution.
-  * GPU inference is a single-instance critical section  -> one forward at a
-    time.
-  * I/O and GPU stages of *different* requests overlap   -> real pipelining.
+  * requests run in parallel on different worker processes (no global I/O or
+    GPU lock), up to the pool size; the rest queue in FIFO order.
   * results never cross-contaminate between concurrent requests.
-  * cancellation unwinds cleanly (locks released, no leaked jobs).
+  * cancellation removes a queued request and stops a running one, freeing its
+    worker.
+  * a worker crash fails only its request and the worker is replaced.
 """
 
 import asyncio
@@ -16,148 +15,170 @@ import time
 import pytest
 
 import serve
-
-
-# --------------------------------------------------------------------------- #
-# Fake stage workers
-# --------------------------------------------------------------------------- #
-def install_fake_stages(monkeypatch, tracker, *, stage_sleep=0.05):
-    """Replace the heavy stage workers with light, instrumented stand-ins.
-
-    Each fake threads the request_id through batch -> preds -> glbs so a test
-    can prove every byte of a result belongs to its own request.
-    """
-
-    def fake_prepare(input_path, params, request_id, cancellation, progress_callback=None):
-        tracker.enter("io", request_id)
-        try:
-            time.sleep(stage_sleep)
-            cancellation.raise_if_cancelled()
-            return {"req": request_id, "num_samples": params.num_samples}
-        finally:
-            tracker.exit("io", request_id)
-
-    def fake_infer(batch, params, request_id, cancellation, progress_callback=None):
-        tracker.enter("gpu", request_id)
-        try:
-            time.sleep(stage_sleep)
-            cancellation.raise_if_cancelled()
-            return [f"pred:{request_id}:{i}" for i in range(batch["num_samples"])]
-        finally:
-            tracker.exit("gpu", request_id)
-
-    def fake_export(preds, params, request_id, cancellation, progress_callback, tmp_output_dir):
-        tracker.enter("io", request_id)
-        try:
-            time.sleep(stage_sleep)
-            cancellation.raise_if_cancelled()
-            return [f"glb:{request_id}:{i}".encode() for i in range(len(preds))]
-        finally:
-            tracker.exit("io", request_id)
-
-    monkeypatch.setattr(serve, "_prepare_inputs", fake_prepare)
-    monkeypatch.setattr(serve, "_run_inference", fake_infer)
-    monkeypatch.setattr(serve, "_export_samples", fake_export)
+from conftest import run_with_pool
+from src.server.pool import WorkerCrashed
 
 
 def make_params(**kw):
     return serve.GenParams(**kw)
 
 
-# --------------------------------------------------------------------------- #
-# Pipeline: serialization, pipelining, no cross-contamination
-# --------------------------------------------------------------------------- #
-def test_io_and_gpu_serialized_and_pipelined(monkeypatch, tracker):
-    install_fake_stages(monkeypatch, tracker)
+def sleep_job(seconds, tag="t"):
+    return {"action": "sleep", "seconds": seconds, "request_id": tag}
 
-    async def scenario():
-        params = make_params(num_samples=1)
-        results = await asyncio.gather(*[
-            serve._generate(b"data", "model.obj", params, f"req{i}")
-            for i in range(4)
+
+def _span(result):
+    pid, span = result
+    start, end = eval(span.decode())
+    return int(pid), start, end
+
+
+# --------------------------------------------------------------------------- #
+# Parallelism and isolation
+# --------------------------------------------------------------------------- #
+def test_requests_run_in_parallel_across_workers():
+    async def scenario(pool):
+        started = time.monotonic()
+        results = await asyncio.gather(*[pool.submit(sleep_job(0.6, f"r{i}"), b"")
+                                         for i in range(4)])
+        return time.monotonic() - started, [_span(r) for r in results]
+
+    elapsed, spans = run_with_pool(scenario, size=2)
+    # Two workers, four 0.6 s jobs: two rounds, not four.
+    assert elapsed < 4 * 0.6, elapsed
+    assert len({pid for pid, _, _ in spans}) == 2
+    # Every moment at most two jobs run, and some do run together.
+    events = sorted([(s, 1) for _, s, _ in spans] + [(e, -1) for _, _, e in spans])
+    running = peak = 0
+    for _, delta in events:
+        running += delta
+        peak = max(peak, running)
+    assert peak == 2
+
+
+def test_no_cross_contamination_between_concurrent_requests():
+    async def scenario(pool):
+        return await asyncio.gather(*[
+            serve._generate(f"data{i}".encode(), "m.glb", make_params(), f"req{i}")
+            for i in range(6)
         ])
-        return results
 
-    results = asyncio.run(scenario())
-
-    # Safety: each resource is a single-instance critical section.
-    assert tracker.max_active["io"] == 1, "two I/O stages ran concurrently"
-    assert tracker.max_active["gpu"] == 1, "two GPU inferences ran concurrently"
-    # Throughput: I/O of one request overlapped GPU of another.
-    assert tracker.overlap_io_gpu, "no I/O/GPU pipelining observed"
-
-    # No cross-contamination: every glb belongs to its own request.
-    assert len(results) == 4
+    results = run_with_pool(scenario, size=3)
     for i, samples in enumerate(results):
-        assert len(samples) == 1
-        glb, meta = samples[0]
-        assert glb == f"glb:req{i}:0".encode()
+        glb, _meta = samples[0]
+        assert glb == f"glb:req{i}:data{i}".encode()
+    assert serve.state.active_jobs == 0
 
 
-def test_no_cross_contamination_multi_sample(monkeypatch, tracker):
-    install_fake_stages(monkeypatch, tracker)
+def test_progress_reaches_the_request_callback():
+    seen = []
 
-    async def scenario():
-        results = {}
-        params = [make_params(num_samples=n) for n in (1, 3, 2)]
+    async def scenario(pool):
+        await serve._generate(b"x", "m.obj", make_params(), "req",
+                              lambda p, s, e: seen.append((p, s)))
 
-        async def one(i):
-            results[i] = await serve._generate(
-                b"x", "m.obj", params[i], f"req{i}"
-            )
-
-        await asyncio.gather(*(one(i) for i in range(3)))
-        return results
-
-    results = asyncio.run(scenario())
-
-    expected_counts = {0: 1, 1: 3, 2: 2}
-    for i, count in expected_counts.items():
-        samples = results[i]
-        assert len(samples) == count
-        for sample_idx, (glb, meta) in enumerate(samples):
-            assert glb == f"glb:req{i}:{sample_idx}".encode()
+    run_with_pool(scenario, size=1)
+    assert seen == [(50, "half way")]
 
 
-def test_gpu_lock_is_single_instance(monkeypatch, tracker):
-    """Even under heavy fan-in, GPU never has more than one occupant."""
-    install_fake_stages(monkeypatch, tracker, stage_sleep=0.02)
+def test_waiting_request_gets_queue_heartbeats_in_fifo_order():
+    beats = []
 
-    async def scenario():
-        params = make_params(num_samples=1)
-        await asyncio.gather(*[
-            serve._generate(b"d", "m.obj", params, f"r{i}") for i in range(8)
-        ])
+    async def scenario(pool):
+        async def queue_cb(phase, waited, ahead):
+            beats.append((phase, ahead))
 
-    asyncio.run(scenario())
-    assert tracker.max_active["gpu"] == 1
+        first = asyncio.create_task(pool.submit(sleep_job(1.6), b""))
+        await asyncio.sleep(0.05)
+        second = asyncio.create_task(pool.submit(sleep_job(0.01), b"", queue_callback=queue_cb))
+        await asyncio.gather(first, second)
+        return pool.status()
 
-
-
+    status = run_with_pool(scenario, size=1)
+    assert beats and beats[0] == ("worker", 0)
+    assert status["busy"] == 0 and status["queued"] == 0
 
 
 # --------------------------------------------------------------------------- #
 # Cancellation
 # --------------------------------------------------------------------------- #
-def test_cancellation_unwinds_pipeline_and_releases_locks(monkeypatch, tracker):
-    install_fake_stages(monkeypatch, tracker, stage_sleep=0.5)
-
-    async def scenario():
-        cancellation = serve.CancellationToken()
-        params = make_params(num_samples=1)
-        task = asyncio.create_task(
-            serve._generate(b"d", "m.obj", params, "req", None, cancellation)
-        )
-        await asyncio.sleep(0.05)
-        cancellation.cancel("test cancel")
+def test_cancel_running_request_frees_its_worker():
+    async def scenario(pool):
+        cancel = serve.CancellationToken()
+        task = asyncio.create_task(pool.submit(sleep_job(30), b"", cancelled=cancel.event))
+        await asyncio.sleep(0.3)
+        started = time.monotonic()
+        cancel.cancel("test cancel")
         with pytest.raises(serve.GenerationCancelled):
             await task
+        stopped_after = time.monotonic() - started
+        # The same (only) worker takes the next request.
+        await pool.submit(sleep_job(0.01), b"")
+        return stopped_after
 
-    asyncio.run(scenario())
+    stopped_after = run_with_pool(scenario, size=1)
+    assert stopped_after < 2.0
 
+
+def test_cancel_queued_request_leaves_the_queue():
+    async def scenario(pool):
+        cancel = serve.CancellationToken()
+        first = asyncio.create_task(pool.submit(sleep_job(0.8), b""))
+        await asyncio.sleep(0.05)
+        queued = asyncio.create_task(pool.submit(sleep_job(0.01), b"", cancelled=cancel.event))
+        await asyncio.sleep(0.05)
+        assert pool.status()["queued"] == 1
+        cancel.cancel("test cancel")
+        with pytest.raises(serve.GenerationCancelled):
+            await queued
+        assert pool.status()["queued"] == 0
+        await first
+        return pool.status()
+
+    status = run_with_pool(scenario, size=1)
+    assert status["idle"] == 1
+
+
+def test_generate_cancellation_raises_with_reason():
+    async def scenario(pool):
+        cancel = serve.CancellationToken()
+        busy = asyncio.create_task(pool.submit(sleep_job(0.5), b""))
+        await asyncio.sleep(0.05)
+        task = asyncio.create_task(serve._generate(b"d", "m.obj", make_params(), "req", None, cancel))
+        await asyncio.sleep(0.05)
+        assert serve.state.active_jobs == 1
+        cancel.cancel("client requested cancellation")
+        with pytest.raises(serve.GenerationCancelled, match="client requested"):
+            await task
+        await busy
+
+    run_with_pool(scenario, size=1)
     assert serve.state.active_jobs == 0
-    assert not serve.state.io_lock.locked()
-    assert not serve.state.gpu_lock.locked()
+
+
+# --------------------------------------------------------------------------- #
+# Failures
+# --------------------------------------------------------------------------- #
+def test_worker_exception_reaches_the_request():
+    async def scenario(pool):
+        with pytest.raises(ValueError, match="bad request value"):
+            await pool.submit({"action": "raise"}, b"")
+        # The worker survives an exception in a job.
+        return await pool.submit({"action": "echo"}, b"ok")
+
+    assert run_with_pool(scenario, size=1)[0] == b"glb:-:ok"
+
+
+def test_crashed_worker_fails_its_request_and_is_replaced():
+    async def scenario(pool):
+        with pytest.raises(WorkerCrashed):
+            await pool.submit({"action": "crash"}, b"")
+        result = await asyncio.wait_for(pool.submit({"action": "echo"}, b"after"), 30)
+        return result, pool.status()
+
+    result, status = run_with_pool(scenario, size=1, restart_delay=0.1)
+    assert result[0] == b"glb:-:after"
+    assert status["restarts"] == 1
 
 
 def test_unsupported_extension_rejected():
@@ -170,21 +191,23 @@ def test_unsupported_extension_rejected():
 
 
 # --------------------------------------------------------------------------- #
-# RNG isolation (fix #3)
+# RNG isolation (pipeline, in-process)
 # --------------------------------------------------------------------------- #
 def test_seeded_rng_is_deterministic():
     import torch
+    from src.server.pipeline import seeded_torch_rng
 
-    with serve._seeded_torch_rng(123):
+    with seeded_torch_rng(123):
         a = torch.rand(8)
-    with serve._seeded_torch_rng(123):
+    with seeded_torch_rng(123):
         b = torch.rand(8)
     assert torch.equal(a, b)
 
 
 def test_seeded_rng_does_not_perturb_surrounding_torch_stream():
-    """A seeded request must not shift another request's global RNG stream."""
+    """A seeded request must not shift the next request's global RNG stream."""
     import torch
+    from src.server.pipeline import seeded_torch_rng
 
     torch.manual_seed(999)
     ref_first = torch.rand(4)
@@ -192,7 +215,7 @@ def test_seeded_rng_does_not_perturb_surrounding_torch_stream():
 
     torch.manual_seed(999)
     again_first = torch.rand(4)
-    with serve._seeded_torch_rng(123):
+    with seeded_torch_rng(123):
         torch.rand(4)  # consume seeded stream; must be rolled back on exit
     again_second = torch.rand(4)
 
@@ -200,24 +223,13 @@ def test_seeded_rng_does_not_perturb_surrounding_torch_stream():
     assert torch.equal(again_second, ref_second)
 
 
-def test_seeded_rng_leaves_numpy_untouched():
-    """Seed is scoped to torch only; numpy belongs to the (serialized) I/O stage."""
-    import numpy as np
-
-    np.random.seed(7)
-    before = np.random.get_state()[1].copy()
-    with serve._seeded_torch_rng(123):
-        pass
-    after = np.random.get_state()[1]
-    assert np.array_equal(before, after)
-
-
 def test_seeded_rng_none_is_passthrough():
     import torch
+    from src.server.pipeline import seeded_torch_rng
 
     torch.manual_seed(42)
     ref = torch.rand(4)
     torch.manual_seed(42)
-    with serve._seeded_torch_rng(None):
+    with seeded_torch_rng(None):
         out = torch.rand(4)
     assert torch.equal(ref, out)

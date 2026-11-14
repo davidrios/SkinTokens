@@ -1,26 +1,23 @@
-"""Shared fixtures for the serve concurrency tests.
+"""Shared fixtures for the server tests.
 
-These tests exercise the real pipeline orchestration in :mod:`serve` (locks,
-executors, cancellation, RNG isolation) while stubbing out the heavy stage
-workers (I/O parse/export, GPU inference) so no model or GPU
-runtime is required.
+The pool tests start real worker processes (``spawn``) running the model-free
+spec in :mod:`pool_fixtures`, so they exercise the real gateway ↔ worker
+protocol (dispatch, progress, cancellation, crashes) without a GPU.
 """
 
 import asyncio
 import logging
-import threading
-import time
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 import serve
 
+FIXTURE_SPEC = "pool_fixtures:ECHO"
+
 
 @pytest.fixture(autouse=True)
 def _quiet_logs():
-    """Silence the per-progress INFO spam during tests."""
+    """Silence the per-request INFO spam during tests."""
     previous = serve.logger.level
     serve.logger.setLevel(logging.WARNING)
     yield
@@ -29,60 +26,25 @@ def _quiet_logs():
 
 @pytest.fixture(autouse=True)
 def fresh_state():
-    """Give every test pristine locks, semaphore, and single-worker executors.
-
-    Locks/semaphores are recreated per test so a waiter future created in one
-    test's event loop never leaks into another test's loop.
-    """
-    io_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-io")
-    gpu_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-gpu")
-
-    serve.state.io_executor = io_executor
-    serve.state.gpu_executor = gpu_executor
-    serve.state.io_lock = asyncio.Lock()
-    serve.state.gpu_lock = asyncio.Lock()
+    serve.state.pool = None
     serve.state.active_jobs = 0
     serve.state.ready = True
-
     yield
-
-    io_executor.shutdown(wait=True, cancel_futures=True)
-    gpu_executor.shutdown(wait=True, cancel_futures=True)
+    serve.state.pool = None
 
 
-class ResourceTracker:
-    """Thread-safe record of how many requests occupy each resource at once.
+def run_with_pool(scenario, size=2, **pool_kwargs):
+    """Run ``scenario(pool)`` on a started fixture pool, installed as the
+    server's pool, and close it afterwards."""
 
-    All stage workers run on executor threads so all bookkeeping is guarded
-    by a plain threading lock.
-    """
+    async def main():
+        pool = serve.WorkerPool(FIXTURE_SPEC, size, **pool_kwargs)
+        await pool.start()
+        serve.state.pool = pool
+        try:
+            return await scenario(pool)
+        finally:
+            serve.state.pool = None
+            await pool.close(timeout=5)
 
-    def __init__(self):
-        self._lock = threading.Lock()
-        self.active = Counter()
-        self.max_active = Counter()
-        self.overlap_io_gpu = False
-        self.events = []
-
-    def enter(self, resource: str, request_id: str):
-        with self._lock:
-            self.active[resource] += 1
-            self.max_active[resource] = max(
-                self.max_active[resource], self.active[resource]
-            )
-            # A single request never holds io and gpu at the same time (its
-            # stages are sequential), so concurrent io+gpu activity proves two
-            # *different* requests are pipelining.
-            if self.active["io"] > 0 and self.active["gpu"] > 0:
-                self.overlap_io_gpu = True
-            self.events.append((time.monotonic(), "enter", resource, request_id))
-
-    def exit(self, resource: str, request_id: str):
-        with self._lock:
-            self.active[resource] -= 1
-            self.events.append((time.monotonic(), "exit", resource, request_id))
-
-
-@pytest.fixture
-def tracker():
-    return ResourceTracker()
+    return asyncio.run(main())

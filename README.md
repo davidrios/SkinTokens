@@ -163,6 +163,19 @@ $env:SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE = "0"
 docker compose up -d
 ```
 
+The server runs a pool of worker processes, each with its own copy of the
+model on the GPU and serving one request at a time, so `SKINTOKENS_WORKERS`
+requests (default 2) are parsed, sampled and exported in parallel;
+further requests queue in FIFO order and receive `queue_ahead` heartbeats.
+Each worker needs roughly 2-4 GB of VRAM. Measure concurrent throughput with:
+
+```powershell
+python scripts/load_test.py --server http://127.0.0.1:8087 -c 4 --json after.json
+python scripts/load_test.py --compare before.json after.json
+```
+
+Each load-test run is capped at 120 seconds.
+
 For lower peak VRAM at the cost of much slower autoregressive decoding, set
 `SKINTOKENS_USE_CACHE=0`. `/dev/shm` can be adjusted with
 `SKINTOKENS_SHM_SIZE`; the Compose default is `1gb` because inference uses
