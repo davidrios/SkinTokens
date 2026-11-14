@@ -132,8 +132,18 @@ class SamplingProgressCriteria(StoppingCriteria):
         progress_start: int = 10,
         progress_end: int = 74,
         estimated_total_tokens: int = 240,
+        grammar=None,
     ) -> None:
         self.progress_callback = progress_callback
+        # A GpuGrammarLogitsProcessor already tracks the switch position and bone
+        # count on the device; read them asynchronously instead of copying the
+        # sequence to the host (a device sync).
+        self.grammar = grammar
+        self._snapshot = None
+        if grammar is not None:
+            from .grammar import AsyncSnapshot
+            self._snapshot = AsyncSnapshot()
+        self._not_done = None
         self.tokenizer = tokenizer
         self.final_eos_token_id = final_eos_token_id
         self.tokens_per_skin = tokens_per_skin
@@ -187,19 +197,39 @@ class SamplingProgressCriteria(StoppingCriteria):
             self.progress_start + math.floor(span * ratio),
         )
 
+    def _estimate_from_grammar(self) -> int:
+        value = self._snapshot.poll()
+        if value is None or not value[0]:
+            return self.estimated_total_tokens
+        _, switch_len, bones = value
+        return max(1, int(switch_len) + int(bones) * self.tokens_per_skin + 1)
+
     def __call__(self, input_ids: Tensor, scores: FloatTensor, **kwargs) -> torch.BoolTensor:
         if self.progress_callback is not None:
             generated_ids = input_ids[0]
             token_count = int(generated_ids.shape[0])
             if token_count - self._last_estimate_token_count >= self._estimate_interval:
-                self._cached_estimate = self._estimated_generated_total(generated_ids)
+                if self._snapshot is not None:
+                    state = self.grammar.progress_state()
+                    if state is not None:
+                        self._snapshot.request(state)
+                    self._cached_estimate = self._estimate_from_grammar()
+                else:
+                    self._cached_estimate = self._estimated_generated_total(generated_ids)
                 self._last_estimate_token_count = token_count
+            elif self._snapshot is not None:
+                self._cached_estimate = self._estimate_from_grammar()
             self.estimated_total_tokens = max(token_count, self._cached_estimate)
             percent = self._percent_for_tokens(token_count)
             if percent > self._last_percent:
                 self._last_percent = percent
                 self.progress_callback(percent, f"{self.stage} ({token_count} tokens)")
-        return torch.zeros((input_ids.shape[0],), dtype=torch.bool, device=input_ids.device)
+        # Never stops a row; one cached tensor instead of an allocation per step.
+        not_done = self._not_done
+        if not_done is None or not_done.shape[0] != input_ids.shape[0] or not_done.device != input_ids.device:
+            not_done = self._not_done = torch.zeros((input_ids.shape[0],), dtype=torch.bool,
+                                                    device=input_ids.device)
+        return not_done
 
 class TokenRig(ModelSpec):
 
@@ -413,6 +443,26 @@ class TokenRig(ModelSpec):
         # stopping criterion instead, which is called once per decode step and
         # works with beam search.
         gen_kwargs = {k: v for k, v in kwargs.items() if k != 'repetition_penalty'}
+        logits_processor = get_logits_processor(
+            tokenizer=self.tokenizer,
+            eos=self.eos,
+            tokens_per_skin=self.tokens_per_skin,
+            start_tokens=start_tokens[0],
+            num_beams=int(gen_kwargs.get('num_beams') or 1),
+        )
+        from .grammar import GpuGrammarLogitsProcessor
+        grammar = logits_processor[0] if isinstance(logits_processor[0], GpuGrammarLogitsProcessor) else None
+        # Fold temperature/top-k/top-p into the grammar's fused step (same order
+        # and semantics as transformers' warpers, which then stay off): for plain
+        # sampling with an explicit top-k.
+        if (grammar is not None and gen_kwargs.get('do_sample') and int(gen_kwargs.get('num_beams') or 1) == 1
+                and int(gen_kwargs.get('top_k') or 0) > 0):
+            grammar.configure_sampling(
+                temperature=float(gen_kwargs.get('temperature', 1.0) or 1.0),
+                top_k=int(gen_kwargs['top_k']),
+                top_p=float(gen_kwargs.get('top_p', 1.0) or 1.0),
+            )
+            gen_kwargs.update(temperature=1.0, top_k=0, top_p=1.0)
         if progress_callback is not None:
             max_new_tokens = int(gen_kwargs.get("max_new_tokens") or 240)
             estimated_total_tokens = max(240, min(max_new_tokens, 512))
@@ -424,6 +474,7 @@ class TokenRig(ModelSpec):
                     tokens_per_skin=self.tokens_per_skin,
                     start_tokens=start_tokens[0],
                     estimated_total_tokens=estimated_total_tokens,
+                    grammar=grammar,
                 )
             ])
 
@@ -432,12 +483,7 @@ class TokenRig(ModelSpec):
             bos_token_id=self.tokenizer.bos,
             eos_token_id=self.eos,
             pad_token_id=self.tokenizer.pad,
-            logits_processor=get_logits_processor(
-                tokenizer=self.tokenizer,
-                eos=self.eos,
-                tokens_per_skin=self.tokens_per_skin,
-                start_tokens=start_tokens[0],
-            ),
+            logits_processor=logits_processor,
             repetition_penalty=None,  # handled by logits_processor instead
             **gen_kwargs,
         )
@@ -754,8 +800,18 @@ def prepare_llm_tokens(
     _check(attention_mask, (B, seq_len))
     return inputs_ids, attention_mask, llm_skeleton_mask, llm_skin_mask
 
-def get_logits_processor(tokenizer: Tokenizer, eos: int, tokens_per_skin: int, start_tokens):
-    processor = VocabSwitchingLogitsProcessor(
+def get_logits_processor(tokenizer: Tokenizer, eos: int, tokens_per_skin: int, start_tokens,
+                         num_beams: int = 1):
+    # The GPU state machine needs no device sync per token; the host version
+    # remains for other tokenizers and as a switch-off (SKINTOKENS_GPU_GRAMMAR=0).
+    from . import grammar
+    # Beam search reorders/duplicates candidate rows. The GPU processor's
+    # incremental state is not reordered with them; the host processor derives
+    # the grammar from each row's full sequence and handles this correctly.
+    processor_cls = (grammar.GpuGrammarLogitsProcessor
+                     if num_beams == 1 and grammar.gpu_grammar_enabled() and grammar.supports(tokenizer)
+                     else VocabSwitchingLogitsProcessor)
+    processor = processor_cls(
         tokenizer=tokenizer,
         switch_token_id=tokenizer.eos,
         eos_token_id=eos,

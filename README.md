@@ -176,6 +176,17 @@ python scripts/load_test.py --compare before.json after.json
 
 Each load-test run is capped at 120 seconds.
 
+With `SKINTOKENS_FAST_DECODE=1` (Compose default) each decode step replays a
+CUDA graph, and these switches control the rest of the step (defaults shown;
+set them to compare or to fall back):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SKINTOKENS_DECODE_ATTN` | `triton` (`math` without Triton) | Decode attention over the static cache: `triton` computes only the filled slots, `math` is fused grouped-query attention over the whole cache, `sdpa` is the previous memory-efficient SDPA path. |
+| `SKINTOKENS_GPU_GRAMMAR` | `1` | Enforce the rig-token grammar with GPU state tensors instead of copying the sequence to the CPU every token. |
+| `SKINTOKENS_GRAMMAR_COMPILE` | `1` with CUDA + Triton | Fuse the grammar step with temperature/top-k/top-p into one compiled function. |
+| `SKINTOKENS_DEFERRED_STOP` | `1` | Check for the end of generation one step late on CUDA, so the host never waits for the GPU between tokens. |
+
 For lower peak VRAM at the cost of much slower autoregressive decoding, set
 `SKINTOKENS_USE_CACHE=0`. `/dev/shm` can be adjusted with
 `SKINTOKENS_SHM_SIZE`; the Compose default is `1gb` because inference uses

@@ -50,7 +50,13 @@ torch.backends.cudnn.allow_tf32 = True
 
 DEVICE = os.environ.get("SKINTOKENS_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
 
-from src.model.attention import LLM_ATTN_IMPL as _DEFAULT_ATTN_IMPL, SDPA_ATTN_IMPL as _SDPA_ATTN_IMPL
+from src.model.attention import LLM_ATTN_IMPL as _DEFAULT_ATTN_IMPL
+from src.model import decode_attention
+
+# The fast decode path's attention: SDPA for prefill, a length-aware kernel for
+# the single-token decode steps over the static cache (src/model/decode_attention.py).
+# Registered with transformers in load(), before any generation.
+_FAST_ATTN_IMPL = decode_attention.DECODE_ATTN_IMPL
 
 __all__ = ["GenerationCancelled", "load", "run_job", "SERVICE"]
 
@@ -74,7 +80,7 @@ def _set_llm_attention(model, impl: str) -> None:
     The mesh encoder and VAE call ``flash_attn_func`` directly (not via config),
     so they are unaffected; only Qwen3's config-dispatched attention changes.
     Flash-attention mis-masks the pre-allocated static cache (it attends over the
-    unfilled slots), so the fast path must run SDPA. No-op if already set.
+    unfilled slots), so the fast path runs ``_FAST_ATTN_IMPL``. No-op if already set.
     """
     cfg = getattr(model.transformer, "config", None)
     if cfg is not None and getattr(cfg, "_attn_implementation", None) == impl:
@@ -169,7 +175,7 @@ def _prewarm_fast_decode() -> None:
                 (input_ids.shape[0],), done, dtype=torch.bool, device=input_ids.device
             )
 
-    _set_llm_attention(model, _SDPA_ATTN_IMPL)
+    _set_llm_attention(model, _FAST_ATTN_IMPL)
     device = model.device
     n_pts = 8192
     vertices = torch.rand(n_pts, 3, device=device) * 2.0 - 1.0
@@ -212,6 +218,10 @@ def load(options: Optional[dict] = None) -> dict:
     threads = options.get("cpu_threads")
     if threads:
         torch.set_num_threads(int(threads))
+    decode_attention.register()
+    # generate() checks for its end one step late instead of syncing every token.
+    from src.model.grammar import enable_cuda_deferred_stop
+    logger.info("deferred stop check on CUDA: %s", enable_cuda_deferred_stop())
 
     def load_model_fn():
         model = get_model(model_ckpt, hf_path=hf_path, device=DEVICE)
@@ -370,10 +380,10 @@ def run_inference(batch: dict, params: GenParams, request_id: str,
                            "falling back to flash/dynamic path", request_id)
             fast_decode = False
     if fast_decode:
-        _set_llm_attention(state.model, _SDPA_ATTN_IMPL)
+        _set_llm_attention(state.model, _FAST_ATTN_IMPL)
         generate_kwargs.update(cache_implementation="static", compile_config=compile_config)
-        logger.info("[%s] fast decode enabled (sdpa + static cache + %s)",
-                    request_id, config.FAST_DECODE_BACKEND)
+        logger.info("[%s] fast decode enabled (%s attention + static cache + %s)",
+                    request_id, decode_attention.DECODE_ATTN_MODE, config.FAST_DECODE_BACKEND)
     elif config.FAST_DECODE:
         # A previous fast request may have switched the model to SDPA; restore
         # flash-attention for the original path.
