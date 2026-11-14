@@ -13,6 +13,8 @@ from src.rig_package.glb_io import Builder, InputLimits
 from src.rig_package.info.asset import Asset
 from src.rig_package.parser.glb import GlbParser, transfer_rigging
 
+EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
+
 LIMITS = InputLimits()
 SECRET = b"SECRET-SERVER-FILE-CONTENT"
 TRIANGLE = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], "<f4")
@@ -175,15 +177,15 @@ def test_limits_from_env(monkeypatch):
 
 
 def test_serve_never_uses_client_filename_as_path(monkeypatch):
-    """The gateway passes only the upload's suffix to the worker, which writes
-    it to a fixed name in its own temp directory."""
+    """The gateway passes only the upload's suffix to the worker, which keeps
+    the upload in memory under a fixed name (nothing is written to disk)."""
     from src.server import pipeline
     from src.server.worker import Cancellation
 
     seen = []
 
-    def fake_prepare(input_path, *args, **kwargs):
-        seen.append(Path(input_path))
+    def fake_prepare(source, *args, **kwargs):
+        seen.append(source)
         raise RuntimeError("stop")
 
     monkeypatch.setitem(pipeline.STAGES, "prepare", fake_prepare)
@@ -192,8 +194,18 @@ def test_serve_never_uses_client_filename_as_path(monkeypatch):
         with pytest.raises(RuntimeError, match="stop"):
             pipeline.run_job({"suffix": suffix, "request_id": "req"}, b"data", Cancellation())
     assert len(seen) == 4
-    assert all(p.name == "input.glb" and p.parent.name.startswith("skintokens_input_") for p in seen)
-    assert not any(p.parent.exists() for p in seen)
+    assert all(isinstance(s, pipeline.Upload) and s.name == "input.glb" and s.data == b"data"
+               for s in seen)
+
+
+def test_in_memory_upload_parses_and_is_size_limited():
+    from src.rig_package.glb_io import load_scene
+    data = (EXAMPLES / "giraffe.glb").read_bytes()
+    assert load_scene(data, name="input.glb").vertex_count == load_scene(EXAMPLES / "giraffe.glb").vertex_count
+    with pytest.raises(ValueError, match="file size"):
+        load_scene(data, limits=InputLimits(max_file_bytes=len(data) - 1), name="input.glb")
+    with pytest.raises(ValueError, match="unsupported type"):
+        load_scene(data, name="input.obj")
 
 
 def test_serve_rejects_oversized_upload(monkeypatch):

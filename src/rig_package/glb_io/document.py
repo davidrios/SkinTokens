@@ -94,6 +94,8 @@ class Document:
         if isinstance(source, (bytes, bytearray)):
             self.path = Path(name or 'memory.glb')
             self.in_memory = True
+            if limits is not None:
+                check_limit(len(source), limits.max_file_bytes, 'file size (bytes)')
             raw = bytes(source)
         else:
             self.path = Path(source)

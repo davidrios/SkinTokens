@@ -68,6 +68,22 @@ def unpack_exception(error: dict) -> BaseException:
     return exc
 
 
+_F_SETPIPE_SZ = 1031  # Linux fcntl.F_SETPIPE_SZ (exposed by Python only from 3.10 on Linux)
+
+
+def _enlarge_pipe(conn, size: int = 1 << 20) -> None:
+    """Grow a pipe's kernel buffer (Linux; capped by /proc/sys/fs/pipe-max-size).
+
+    Best effort: elsewhere (Windows named pipes) or when refused, nothing changes.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        return
+    with suppress(OSError, ValueError, AttributeError):
+        fcntl.fcntl(conn.fileno(), getattr(fcntl, "F_SETPIPE_SZ", _F_SETPIPE_SZ), size)
+
+
 @dataclass
 class _Job:
     id: int
@@ -86,6 +102,10 @@ class _Worker:
         ctx = multiprocessing.get_context("spawn")
         jobs_read, self.jobs = ctx.Pipe(duplex=False)
         self.events, events_write = ctx.Pipe(duplex=False)
+        # Uploads and results are tens of MB; a pipe's default 64 KiB buffer
+        # turns each into ~1000 sender/receiver hand-offs.
+        _enlarge_pipe(self.jobs)
+        _enlarge_pipe(self.events)
         self.process = ctx.Process(
             target=worker_module.main,
             args=(pool.spec, jobs_read, events_write, pool.options),

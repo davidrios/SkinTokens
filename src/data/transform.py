@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from ..rig_package.info.asset import Asset
-from .augment import Augment, get_augments
+from .augment import Augment, AugmentAffine, get_augments
 from .order import Order
 from .sampler import Sampler, get_sampler
 from .spec import ConfigSpec
@@ -38,8 +38,17 @@ class Transform(ConfigSpec):
             d['sampler'] = get_sampler(**sampler_config)
         return Transform(**d)
     
-    def apply(self, asset: Asset, **kwargs):
-        
+    @property
+    def rebuilds_normals(self) -> bool:
+        """True if :meth:`apply` moves the vertices with an affine augment, so
+        normals loaded with the mesh would only be recomputed: load the mesh
+        without them and the sampler computes them at the sampled points."""
+        return any(isinstance(a, AugmentAffine) for a in self.augments or [])
+
+    def apply(self, asset: Asset, sample: bool=True, **kwargs):
+        """Apply the transform in place. ``sample=False`` stops before drawing
+        the point cloud, for callers that sample it themselves."""
+
         # 1. arrange bones
         if self.order is not None:
             if asset.joint_names is not None and asset.parents is not None:
@@ -62,7 +71,7 @@ class Transform(ConfigSpec):
             asset.vertex_groups = {}
         
         # 4. sample
-        if self.sampler is not None:
+        if sample and self.sampler is not None:
             res = self.sampler.sample(asset=asset)
             asset.sampled_vertices          = res.sampled_vertices
             asset.sampled_normals           = res.sampled_normals

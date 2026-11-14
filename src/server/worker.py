@@ -68,10 +68,13 @@ class ServiceSpec:
     ``load(options)`` loads the model into this process and returns what the
     gateway needs to know about it (sent once, when the worker is ready).
     ``run(params, upload, cancellation, progress)`` serves one request.
+    ``idle()`` (optional) runs in the worker after each request's reply has
+    been sent, for housekeeping that must not delay that reply.
     """
     name: str
     load: Callable[[dict], dict]
     run: Callable[[dict, bytes, Cancellation, ProgressCallback], Any]
+    idle: Optional[Callable[[], None]] = None
 
 
 class _Sender:
@@ -213,3 +216,8 @@ def main(spec_reference: str, jobs, events, options: dict) -> None:
             return
         except Exception as exc:  # A result that cannot be pickled.
             sender.send(("error", job_id, pack_exception(exc)))
+        if spec.idle is not None:
+            try:
+                spec.idle()
+            except Exception:  # Housekeeping never fails the worker.
+                log.exception("idle hook failed")

@@ -20,6 +20,7 @@ import numpy as np
 from .builder import ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER, Builder
 from .document import Document, malformed_as_value_error, node_local_matrix
 from .limits import InputLimits, check_limit
+from ..skin_interp import clean_skin, select_top_k
 
 # glTF (x, y, z) Y-up  ->  Blender (x, -z, y) Z-up.
 Y_UP_TO_Z_UP = np.array([[1., 0., 0.], [0., 0., -1.], [0., 1., 0.]])
@@ -220,8 +221,17 @@ def _triangulate(idx: np.ndarray, mode: int) -> np.ndarray:
 # ---------------------------------------------------------------------- #
 # loading
 # ---------------------------------------------------------------------- #
-def load_scene(filepath, limits: Optional[InputLimits] = None) -> Scene:
-    """Load a .glb/.gltf scene. Pass ``limits`` for untrusted (uploaded) input."""
+def load_scene(filepath, limits: Optional[InputLimits] = None, name: Optional[str] = None) -> Scene:
+    """Load a .glb/.gltf scene. Pass ``limits`` for untrusted (uploaded) input.
+
+    ``filepath`` may also be the file's bytes, with ``name`` giving its
+    extension (an in-memory glTF must embed its resources).
+    """
+    if isinstance(filepath, (bytes, bytearray, memoryview)):
+        name = name or 'memory.glb'
+        if Path(name).suffix.lower() not in SUPPORTED_SCENE_EXT:
+            raise ValueError(f'unsupported type: {Path(name).suffix}; expected one of {SUPPORTED_SCENE_EXT}')
+        return Scene(Document(bytes(filepath), name=name, limits=limits))
     path = Path(filepath)
     if not path.exists():
         raise RuntimeError(f'file does not exist: {filepath}')
@@ -236,13 +246,38 @@ def load_scene(filepath, limits: Optional[InputLimits] = None) -> Scene:
 # ---------------------------------------------------------------------- #
 # export
 # ---------------------------------------------------------------------- #
+@dataclass
+class SparseSkin:
+    """Each vertex's heaviest influences, as :func:`interpolate_top_k` returns
+    them: ``ids`` and ``weights`` are ``(N, k)``, heaviest first, weights
+    finite and non-negative (not yet normalized)."""
+    ids: np.ndarray
+    weights: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def take(self, rows: np.ndarray) -> 'SparseSkin':
+        return SparseSkin(self.ids[rows], self.weights[rows])
+
+
 def _sparsify(skin: np.ndarray, group_per_vertex: int, fallback_joint: int, normalize: bool = True):
     """Top-k influences per vertex, padded to a multiple of 4 slots."""
-    skin = np.maximum(np.nan_to_num(np.asarray(skin, dtype=np.float64)), 0.)
-    n, J = skin.shape
+    skin = np.asarray(skin)
+    if not np.issubdtype(skin.dtype, np.floating):
+        skin = skin.astype(np.float64)
+    J = skin.shape[1]
     k = J if group_per_vertex is None or group_per_vertex <= 0 else min(group_per_vertex, J)
-    ids = np.argsort(-skin, axis=1, kind='stable')[:, :k]
-    w = np.take_along_axis(skin, ids, axis=1)
+    ids, w = select_top_k(clean_skin(skin), k)
+    return _finish_sparse(ids, w, fallback_joint, normalize)
+
+
+def _finish_sparse(ids: np.ndarray, w: np.ndarray, fallback_joint: int, normalize: bool):
+    """Glue for selected influences: fallback for empty rows, normalization,
+    unused slots on joint 0, padding to a multiple of 4 slots."""
+    k = ids.shape[1]
+    ids = np.array(ids, dtype=np.int64)
+    w = np.array(w, dtype=np.float64)
     total = w.sum(axis=1)
     empty = total <= 1e-8
     # glTF requires every skinned vertex to have nonzero weight.
@@ -296,7 +331,8 @@ def export_skinned_glb(
 
     Args:
         joints: (J, 3) bind-pose joint heads in glTF world space (Y-up).
-        skin: (N, J) weights for ``scene.vertices()`` in the same order.
+        skin: (N, J) weights for ``scene.vertices()`` in the same order, or
+            their already selected top influences as a :class:`SparseSkin`.
         offset: optional (3,) translation applied to meshes and joints together.
 
     Output is the skinned mesh only: positions, normals, triangle
@@ -319,7 +355,12 @@ def _export_skinned_glb(scene, filepath, joints, parents, joint_names, skin, *,
     J = len(joints)
     if J == 0 or parents.shape != (J,) or len(joint_names) != J:
         raise ValueError('Skeleton joints, parents and names must have the same nonzero length')
-    if skin.shape != (scene.vertex_count, J):
+    if isinstance(skin, SparseSkin):
+        if len(skin) != scene.vertex_count or skin.ids.shape != skin.weights.shape:
+            raise ValueError(f'Sparse skin of {len(skin)} rows does not match {scene.vertex_count} vertices')
+        if skin.ids.size and (skin.ids.min() < 0 or skin.ids.max() >= J):
+            raise ValueError('Sparse skin joint index out of range')
+    elif skin.shape != (scene.vertex_count, J):
         raise ValueError(f'Skin shape {skin.shape} does not match ({scene.vertex_count}, {J})')
     if np.any(parents >= J) or np.any(parents < -1):
         raise ValueError('Invalid joint parent index')
@@ -344,7 +385,13 @@ def _export_skinned_glb(scene, filepath, joints, parents, joint_names, skin, *,
     data['skins'] = [{'name': armature_name, 'skeleton': 0, 'joints': list(range(1, J + 1)),
                       'inverseBindMatrices': builder.accessor(ibm.transpose(0, 2, 1).reshape(J, 16), 'MAT4')}]
     fallback = roots[0]
-    ids_all, weights_all = _sparsify(skin, group_per_vertex, fallback, normalize)
+    if isinstance(skin, SparseSkin):
+        k = skin.ids.shape[1]
+        if group_per_vertex is not None and group_per_vertex > 0:
+            k = min(k, group_per_vertex)
+        ids_all, weights_all = _finish_sparse(skin.ids[:, :k], skin.weights[:, :k], fallback, normalize)
+    else:
+        ids_all, weights_all = _sparsify(skin, group_per_vertex, fallback, normalize)
     joint_component = np.uint8 if J <= 256 else np.uint16
     if J > 65536:
         raise ValueError('Too many joints for a glTF skin')

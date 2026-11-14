@@ -38,3 +38,13 @@ def _run(params, upload, cancellation, progress):
 
 
 ECHO = ServiceSpec("echo", _load, _run)
+
+
+def _idle():
+    """Housekeeping that runs after the reply: slow, then leaves a marker."""
+    time.sleep(0.5)
+    with open(os.environ["IDLE_MARKER"], "w") as f:
+        f.write("idle")
+
+
+IDLE = ServiceSpec("idle", _load, _run, _idle)

@@ -474,7 +474,7 @@ class TokenRig(ModelSpec):
         results = self.transformer.generate(
             inputs_embeds=inputs_embeds,
             bos_token_id=self.tokenizer.bos,
-            eos_token_id=self.eos,
+            eos_token_id=self.tokenizer.eos,
             pad_token_id=self.tokenizer.pad,
             logits_processor=logits_processor,
             # Greedy: the grammar masks the logits, then the argmax is taken.
@@ -610,11 +610,18 @@ class TokenRig(ModelSpec):
         num_joints=None,
         make_asset: bool=False,
         progress_callback=None,
+        interpolate_skin: bool=True,
         **kwargs
     ) -> Dict:
         """``batch['vertices']``/``['normals']`` are ``(B, P, 3)`` (one point
         cloud per item) or ``(B, S, P, 3)`` (S clouds per item, one result
-        each, see :func:`src.data.seeding.sample_point_clouds`)."""
+        each, see :func:`src.data.seeding.sample_point_clouds`).
+
+        With ``make_asset``, each result's ``asset`` is the input mesh with the
+        predicted skeleton and its skin interpolated onto the mesh vertices; or,
+        with ``interpolate_skin=False``, the skin left at the sampled points
+        (``asset.sampled_vertices`` and ``asset.sampled_vertex_groups['skin']``)
+        for the caller to interpolate, e.g. only as far as it needs."""
         vertices: Tensor   = batch['vertices']
         normals : Tensor   = batch['normals']
         cls = batch['cls']
@@ -659,21 +666,23 @@ class TokenRig(ModelSpec):
                             "generation produced incomplete skin tokens: "
                             f"expected {expected}, got {actual}"
                         )
-                    asset: Asset = batch['model_input'][i].asset.copy()
-                    joint_names = res.detokenize_output.joint_names
-                    pred_joints = res.detokenize_output.joints
-                    pred_parents = np.array(res.detokenize_output.parents)
+                    asset: Asset = batch['model_input'][i].asset
+                    sampled_vertices = vertices[i, s].detach().float().cpu().numpy()
+                    sampled_skin = res.skin_pred.detach().float().cpu().numpy()
                     res.asset = Asset.from_data(
-                        vertices=asset.vertices,
-                        faces=asset.faces,
-                        sampled_vertices=vertices[i, s].detach().float().cpu().numpy(),
-                        sampled_skin=res.skin_pred.detach().float().cpu().numpy(),
-                        joints=pred_joints,
-                        parents=pred_parents,
-                        joint_names=joint_names,
+                        vertices=asset.vertices.copy(),
+                        faces=asset.faces.copy() if asset.faces is not None else None,
+                        sampled_vertices=sampled_vertices if interpolate_skin else None,
+                        sampled_skin=sampled_skin if interpolate_skin else None,
+                        joints=res.detokenize_output.joints,
+                        parents=np.array(res.detokenize_output.parents),
+                        joint_names=res.detokenize_output.joint_names,
                         cls=asset.cls,
                         path=asset.path,
                     )
+                    if not interpolate_skin:
+                        res.asset.sampled_vertices = sampled_vertices
+                        res.asset.sampled_vertex_groups = {'skin': sampled_skin}
                 results.append(res)
         d['results'] = results
         return d

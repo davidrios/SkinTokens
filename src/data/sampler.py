@@ -114,6 +114,8 @@ class SamplerMix(Sampler, ConfigSpec):
             face_mask=None,
             shuffle=True,
             same=True,
+            # An asset loaded without normals gets them at the sampled points only.
+            normals_on_demand=True,
         )
         if vertex_groups is not None:
             final_sampled_vertices = final_sampled_vertices[:, 0]

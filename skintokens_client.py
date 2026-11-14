@@ -89,8 +89,11 @@ async def _run(args) -> None:
     try:
         async with websockets.connect(
             ws_url,
-            max_size=64 * 1024 * 1024,
+            # Rigged GLBs grow with the mesh (about 70 bytes per vertex).
+            max_size=1024 * 1024 * 1024,
             open_timeout=args.timeout,
+            # GLB data barely compresses; deflating it costs seconds.
+            compression=None,
         ) as ws:
             await ws.send(json.dumps(payload))
             await ws.send(file_data)

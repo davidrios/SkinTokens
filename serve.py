@@ -448,8 +448,12 @@ def main():
         for name, formatter in uvicorn.config.LOGGING_CONFIG["formatters"].items()
     }
     # One gateway process (uvicorn workers=1): the model workers are the pool's.
+    # No per-message deflate: uploads and rigged GLBs are mostly float data that
+    # barely compresses, and zlib-ing tens of MB (on the event loop, stalling
+    # every other connection) cost ~2s per request on a 24 MB upload.
     uvicorn.run(app, host=args.host, port=args.port, workers=1,
-                ws_max_size=MAX_UPLOAD_BYTES + 64 * 1024, log_config=log_config)
+                ws_max_size=MAX_UPLOAD_BYTES + 64 * 1024, ws_per_message_deflate=False,
+                log_config=log_config)
 
 
 if __name__ == "__main__":

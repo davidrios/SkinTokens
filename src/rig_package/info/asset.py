@@ -1,13 +1,12 @@
 from dataclasses import dataclass, field
 from numpy import ndarray
-from scipy.spatial import cKDTree # type: ignore
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import os
-import trimesh
 
-from ..utils import assert_list, assert_ndarray, linear_blend_skinning, sample_vertex_groups
+from ..skin_interp import interpolate_skin
+from ..utils import assert_list, assert_ndarray, linear_blend_skinning, mesh_normals, sample_vertex_groups
 from .voxel import Voxel
 
 @dataclass
@@ -226,6 +225,7 @@ class Asset():
         """
         if len(np.unique(new_orders)) != len(new_orders):
             raise ValueError("multiple values found in new_orders")
+        old_J = self.J
         _new_orders = self.names_to_ids(arr=new_orders)
         ancestors = []
         grandsons = []
@@ -270,17 +270,28 @@ class Asset():
             self.matrix_local = self.matrix_local[_new_orders]
         if self.matrix_basis is not None:
             self.matrix_basis = self.matrix_basis[:, _new_orders]
+        def reorder(skin: ndarray) -> ndarray:
+            if not merge_skin:
+                return skin[:, _new_orders]
+            out = skin[:, _new_orders]  # a copy (fancy indexing)
+            for x, y in zip(ancestors, grandsons):
+                out[:, x] += skin[:, y]
+            if beyond_root:
+                out[:, root_id] += skin[:, beyond_root].sum(axis=1)
+            return out
+
         if self.skin is not None:
-            if merge_skin:
-                skin = self.skin.copy()
-                self.skin = skin[:, _new_orders]
-                for x, y in zip(ancestors, grandsons):
-                    self.skin[:, x] += skin[:, y]
-                self.skin[:, root_id] += skin[:, beyond_root].sum(axis=1)
-            else:
-                self.skin = self.skin[:, _new_orders]
-                if not do_not_normalize:
-                    self.normalize_skin()
+            self.skin = reorder(self.skin)
+            if not merge_skin and not do_not_normalize:
+                self.normalize_skin()
+        # The skin at the sampled points (a prediction not yet interpolated
+        # onto the mesh) follows the joints the same way.
+        sampled_skin = (self.sampled_vertex_groups or {}).get('skin')
+        if sampled_skin is not None and sampled_skin.ndim == 2 and sampled_skin.shape[1] == old_J:
+            sampled_skin = reorder(sampled_skin)
+            if not merge_skin and not do_not_normalize:
+                sampled_skin = sampled_skin / np.maximum(sampled_skin.sum(axis=1, keepdims=True), 1e-8)
+            self.sampled_vertex_groups['skin'] = sampled_skin
     
     def delete_joints(self, joints_to_remove: List[int|str]):
         """
@@ -424,15 +435,13 @@ class Asset():
     
     def build_normals(self):
         """
-        Build vertex_normals and face_normals using trimesh.
+        Build vertex_normals and face_normals (as trimesh defines them).
         """
         if self.vertices is None:
             raise ValueError("do not have vertices")
         if self.faces is None:
             raise ValueError("do not have faces")
-        mesh = trimesh.Trimesh(vertices=self.vertices, faces=self.faces, process=False, maintain_order=True)
-        self.vertex_normals = mesh.vertex_normals.copy()
-        self.face_normals = mesh.face_normals.copy()
+        self.vertex_normals, self.face_normals = mesh_normals(self.vertices, self.faces)
     
     def normalize_vertices(
         self,
@@ -558,7 +567,11 @@ class Asset():
             self.vertices = _apply(self.vertices, trans)
         if self.matrix_local is not None:
             self.matrix_local = trans @ self.matrix_local
-        self.build_normals()
+        # Keep existing normals up to date; an asset without normals stays
+        # without (whoever needs them computes them, e.g. the sampler only at
+        # the sampled points).
+        if self.vertex_normals is not None or self.face_normals is not None:
+            self.build_normals()
     
     def trim_skeleton(self):
         """remove all leaf bones and coordinate bones"""
@@ -831,16 +844,8 @@ class Asset():
             joints_names = [f"unknown_{i}" for i in range(matrix_local.shape[0])]
         
         if sampled_vertices is not None and vertices is not None and sampled_skin is not None:
-            tree = cKDTree(sampled_vertices)
-            k = min(8, sampled_vertices.shape[0])
-            distances, indices = tree.query(vertices, k=k)
-            if k == 1:
-                skin = sampled_skin[indices]
-            else:
-                # smooth interpolation with inverse-distance weights
-                weights = 1.0 / (distances + 1e-8)
-                weights = weights / np.sum(weights, axis=1, keepdims=True)
-                skin = np.einsum("nk,nkj->nj", weights, sampled_skin[indices])
+            # smooth interpolation with inverse-distance weights of the 8 nearest points
+            skin = interpolate_skin(vertices, sampled_vertices, sampled_skin)
         asset = Asset(
             vertices=vertices,
             faces=faces,

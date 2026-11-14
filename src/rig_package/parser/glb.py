@@ -7,16 +7,17 @@ world space (skinned meshes in bind space), so ``matrix_world`` is identity.
 """
 from __future__ import annotations
 
+import io
 import os
 from typing import Optional
 
 import numpy as np
-import trimesh
 from numpy import ndarray
 
-from ..glb_io import Y_UP_TO_Z_UP, Z_UP_TO_Y_UP, Document, InputLimits, Scene, export_skinned_glb, load_scene
+from ..glb_io import Y_UP_TO_Z_UP, Z_UP_TO_Y_UP, Document, InputLimits, Scene, SparseSkin, export_skinned_glb, load_scene
 from ..glb_io.scene import asset_mesh_glb_bytes
 from ..info.asset import Asset
+from ..utils import mesh_normals
 from .abstract import AbstractParser
 
 
@@ -46,9 +47,7 @@ def _scene_mesh(scene: Scene, include_faces: bool = True, include_normals: bool 
         all_faces = None
     vertex_normals = face_normals = None
     if all_faces is not None and include_normals:
-        mesh = trimesh.Trimesh(vertices=vertices, faces=all_faces, process=False, maintain_order=True)
-        vertex_normals = mesh.vertex_normals
-        face_normals = mesh.face_normals
+        vertex_normals, face_normals = mesh_normals(vertices, all_faces)
     return {
         'mesh_names': np.array(names),
         'vertices': vertices,
@@ -69,8 +68,16 @@ class GlbParser(AbstractParser):
         Any skin, joints or animation in the file are ignored: rigs are output
         only. Pass ``limits`` for untrusted (uploaded) files; see ``glb_io.limits``.
         """
-        scene = load_scene(filepath, limits=limits)
-        mesh = _scene_mesh(scene)
+        return cls.asset_from_scene(load_scene(filepath, limits=limits))
+
+    @classmethod
+    def asset_from_scene(cls, scene: Scene, include_normals: bool = True) -> Asset:
+        """The merged-mesh :class:`Asset` of an already loaded scene.
+
+        ``include_normals=False`` skips the (full-mesh) trimesh normal
+        computation, for callers that rebuild the normals anyway.
+        """
+        mesh = _scene_mesh(scene, include_normals=include_normals)
         return Asset(
             vertices=mesh['vertices'],
             faces=mesh['faces'],
@@ -170,9 +177,9 @@ class GlbParser(AbstractParser):
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
 
-def _export(scene: Scene, filepath: str, joints_z_up: ndarray, parents, joint_names, skin: ndarray,
+def _export(scene: Scene, filepath: str, joints_z_up: ndarray, parents, joint_names, skin,
             group_per_vertex: int, normalize: bool, auto_ground: bool, armature_name: str='Armature'):
-    if os.path.splitext(filepath)[1].lower() != '.glb':
+    if not hasattr(filepath, 'write') and os.path.splitext(filepath)[1].lower() != '.glb':
         raise ValueError(f"Rigged export supports .glb only, got: {filepath}")
     offset = None
     if auto_ground:
@@ -258,21 +265,30 @@ def estimate_similarity_transform(
 
 def transfer_rigging(
     source_asset: Asset,
-    target_path: str,
-    export_path: str,
+    target_path: Optional[str]=None,
+    export_path: Optional[str]=None,
     group_per_vertex: int=4,
     auto_ground: bool=False,
     max_points: Optional[int]=None,
     do_not_normalize: bool=False,
     limits: Optional[InputLimits]=None,
+    scene: Optional[Scene]=None,
+    skin: Optional[ndarray | SparseSkin]=None,
     **kwargs,
-):
+) -> Optional[bytes]:
     """Map a predicted (normalized-space) rig back onto the original file and export GLB.
 
-    The source asset's mesh is aligned to the reloaded target mesh with a
-    similarity transform; joints follow it and skin weights are transferred by
-    nearest vertex. Only the skinned mesh is exported (no materials/textures).
+    The source asset's mesh is aligned to the target mesh with a similarity
+    transform; joints follow it and skin weights are transferred by nearest
+    vertex. Only the skinned mesh is exported (no materials/textures).
     Pass ``limits`` when ``target_path`` is an untrusted upload.
+
+    The target is ``scene`` (already loaded, so a caller exporting several
+    samples parses the file once) or else the file at ``target_path``. The GLB
+    is written to ``export_path``, or returned as bytes when that is ``None``.
+
+    ``skin`` (per source vertex, dense or a :class:`SparseSkin`) replaces
+    ``source_asset.skin``.
     """
     assert source_asset.matrix_local is not None
     assert source_asset.parents is not None
@@ -280,24 +296,36 @@ def transfer_rigging(
     source_joints = source_asset.joints
     assert source_vertices is not None and source_joints is not None
 
-    scene = load_scene(target_path, limits=limits)
+    if scene is None:
+        if target_path is None:
+            raise ValueError("transfer_rigging needs a scene or a target_path")
+        scene = load_scene(target_path, limits=limits)
     target_vertices = _to_z_up(scene.vertices())
     if len(target_vertices) == 0:
-        raise ValueError(f"No mesh vertices found in {target_path}")
+        raise ValueError(f"No mesh vertices found in {target_path or scene.document.path}")
 
     T = estimate_similarity_transform(src=source_vertices, tgt=target_vertices, max_points=max_points or 4096)
     target_joints = source_joints @ T[:3, :3].T + T[:3, 3]
 
     J = len(source_joints)
-    if source_asset.skin is not None:
+    source_skin = source_asset.skin if skin is None else skin
+    if source_skin is None:
+        skin = np.zeros((len(target_vertices), J), dtype=np.float32)
+    elif len(source_vertices) == len(target_vertices):
+        # The source mesh is the target mesh in the model's normalized frame
+        # (same vertices, same order; this is also what the Umeyama fit above
+        # assumes), so the nearest source vertex of every target vertex is
+        # itself. Skip the KD-tree.
+        skin = source_skin
+    else:
         from scipy.spatial import cKDTree
         mapped = source_vertices @ T[:3, :3].T + T[:3, 3]
         _, idx = cKDTree(mapped).query(target_vertices, k=1)
-        skin = source_asset.skin[idx]
-    else:
-        skin = np.zeros((len(target_vertices), J), dtype=np.float32)
+        skin = source_skin.take(idx) if isinstance(source_skin, SparseSkin) else source_skin[idx]
 
     joint_names = source_asset.joint_names if source_asset.joint_names is not None else [f"unknown_{i}" for i in range(J)]
-    _export(scene, export_path, target_joints, source_asset.parents, joint_names, skin,
+    out = io.BytesIO() if export_path is None else export_path
+    _export(scene, out, target_joints, source_asset.parents, joint_names, skin,
             group_per_vertex=group_per_vertex, normalize=not do_not_normalize,
             auto_ground=auto_ground, armature_name=source_asset.armature_name or 'Armature')
+    return out.getvalue() if export_path is None else None

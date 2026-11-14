@@ -41,13 +41,13 @@ class Builder:
     def append(self, payload):
         self.blob.extend(b'\0' * (-len(self.blob) % 4))
         offset = len(self.blob)
-        self.blob.extend(payload)
+        self.blob += payload  # any bytes-like: an array's memory is copied once, here
         return offset
 
     def view(self, payload, target=None):
         offset = self.append(payload)
         views = self.data.setdefault('bufferViews', [])
-        entry = {'buffer': 0, 'byteOffset': offset, 'byteLength': len(payload)}
+        entry = {'buffer': 0, 'byteOffset': offset, 'byteLength': memoryview(payload).nbytes}
         if target is not None:
             entry['target'] = target
         views.append(entry)
@@ -57,7 +57,9 @@ class Builder:
         values = np.asarray(values, dtype=_COMPONENT_DTYPES[component])
         if not np.all(np.isfinite(values)):
             raise ValueError('Cannot export non-finite accessor values')
-        entry = {'bufferView': self.view(values.tobytes(), target=target), 'componentType': component,
+        # The array's own memory goes straight into the blob (no tobytes() copy).
+        raw = memoryview(np.ascontiguousarray(values).reshape(-1).view(np.uint8))
+        entry = {'bufferView': self.view(raw, target=target), 'componentType': component,
                  'count': len(values), 'type': kind}
         if normalized:
             entry['normalized'] = True
@@ -77,11 +79,16 @@ class Builder:
             self.data.pop('buffers', None)
         text = json.dumps(self.data, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode('utf8')
         text += b' ' * (-len(text) % 4)
-        chunks = struct.pack('<II', len(text), CHUNK_JSON) + text
+        json_chunk = struct.pack('<II', len(text), CHUNK_JSON)
+        parts = [json_chunk, text]
+        length = 12 + len(json_chunk) + len(text)
         if self.blob:
-            binary = bytes(self.blob) + b'\0' * (-len(self.blob) % 4)
-            chunks += struct.pack('<II', len(binary), CHUNK_BIN) + binary
-        return struct.pack('<III', GLB_MAGIC, 2, len(chunks) + 12) + chunks
+            pad = bytes(1) * (-len(self.blob) % 4)
+            bin_size = len(self.blob) + len(pad)
+            parts += [struct.pack('<II', bin_size, CHUNK_BIN), self.blob, pad]
+            length += 8 + bin_size
+        # One join: the binary buffer is copied once, into the final bytes.
+        return b''.join([struct.pack('<III', GLB_MAGIC, 2, length)] + parts)
 
     def write(self, filepath):
         """Write the GLB to a ``.glb`` path or a writable binary stream."""

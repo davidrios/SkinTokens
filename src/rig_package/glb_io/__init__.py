@@ -12,6 +12,7 @@ from .scene import (
     Z_UP_TO_Y_UP,
     MeshInstance,
     Scene,
+    SparseSkin,
     export_skinned_glb,
     load_scene,
 )
@@ -19,5 +20,5 @@ from .scene import (
 __all__ = [
     'Builder', 'write_glb_bytes', 'Document', 'compose', 'decompose', 'InputLimits',
     'SUPPORTED_SCENE_EXT', 'Y_UP_TO_Z_UP', 'Z_UP_TO_Y_UP', 'MeshInstance',
-    'Scene', 'export_skinned_glb', 'load_scene',
+    'Scene', 'SparseSkin', 'export_skinned_glb', 'load_scene',
 ]

@@ -28,8 +28,6 @@ if not os.path.exists("/dev/dxg"):
 import dataclasses
 import gc
 import logging
-import shutil
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -63,6 +61,7 @@ class _State:
     model = None
     tokenizer = None
     transform = None
+    release_pending = False
 
 
 state = _State()
@@ -271,52 +270,67 @@ def _report_sample_progress(progress_callback, sample_count: int, sample_idx: in
     progress_callback(percent, step)
 
 
-def prepare_inputs(input_path: Path, params: GenParams, request_id: str,
+@dataclasses.dataclass(frozen=True)
+class Upload:
+    """An uploaded file, kept in memory (never written to disk). ``name`` is
+    chosen by the server (``input`` + the validated suffix); the client's
+    filename is used for nothing."""
+    data: bytes
+    name: str
+
+
+def _load_input(source, limits):
+    """Parse ``source`` (an :class:`Upload` or a file path) as a scene."""
+    from src.rig_package.glb_io import load_scene
+    if isinstance(source, Upload):
+        return load_scene(source.data, limits=limits, name=source.name)
+    return load_scene(source, limits=limits)
+
+
+def prepare_inputs(source, params: GenParams, request_id: str,
                    cancellation: Cancellation, progress_callback=None):
-    """Stage 1 (CPU): parse the input file into a single model batch holding
-    ``params.num_samples`` point clouds, cloud ``i`` sampled under
-    ``derive_seed(params.seed, i)``."""
-    from src.data.dataset import DatasetConfig, RigDatasetModule
+    """Stage 1 (CPU): parse the input (an :class:`Upload`, or a file path) into
+    a single model batch holding ``params.num_samples`` point clouds, cloud
+    ``i`` sampled under ``derive_seed(params.seed, i)``.
+
+    The batch carries the parsed ``scene`` too, so export need not parse the
+    file again; :func:`run_job` takes it out before inference.
+    """
     from src.data.seeding import sample_point_clouds, seeded_rng
+    from src.model.spec import ModelInput
+    from src.rig_package.glb_io import InputLimits
+    from src.rig_package.parser.glb import GlbParser
 
     cancellation.raise_if_cancelled()
     if progress_callback:
         progress_callback(5, "building dataset")
 
-    datapath = {
-        "data_name": None,
-        "loader": "glb_untrusted",
-        "filepaths": {"articulation": [str(input_path)]},
-    }
-    dataset_config = DatasetConfig.parse(
-        shuffle=False,
-        batch_size=1,
-        num_workers=0,
-        pin_memory=DEVICE.startswith("cuda"),
-        persistent_workers=False,
-        datapath=datapath,
-    ).split_by_cls()
-
-    module = RigDatasetModule(
-        predict_dataset_config=dataset_config,
-        predict_transform=state.transform,
-        tokenizer=state.tokenizer,
-        process_fn=state.model._process_fn,
-    )
-    dataloader = module.predict_dataloader()["articulation"]
+    transform = state.transform
+    scene = _load_input(source, InputLimits.from_env())
+    # The model only sees normals at its sampled points (the export copies
+    # the file's own). When the transform moves the vertices, normals are
+    # not loaded and the sampler computes them at its points only.
+    asset = GlbParser.asset_from_scene(scene, include_normals=not transform.rebuilds_normals)
+    # The class the model is conditioned on (the dataset key the dataloader
+    # path used to derive it from).
+    asset.cls = "articulation"
+    asset.path = source.name if isinstance(source, Upload) else str(source)
     cancellation.raise_if_cancelled()
 
     with seeded_rng(params.seed):
-        batch = next(iter(dataloader), None)
-    if batch is None:
-        raise RuntimeError("No data in dataloader")
+        transform.apply(asset=asset, sample=False)
     cancellation.raise_if_cancelled()
-    # The loader sampled one cloud; replace it with one per sample.
-    asset = batch["model_input"][0].asset
-    vertices, normals = sample_point_clouds(asset, state.transform.sampler,
+
+    # One cloud per sample (the transform's own single cloud is not drawn).
+    vertices, normals = sample_point_clouds(asset, transform.sampler,
                                             params.seed, params.num_samples)
-    batch["vertices"], batch["normals"] = vertices.unsqueeze(0), normals.unsqueeze(0)
-    return batch
+    return {
+        "vertices": vertices.unsqueeze(0),
+        "normals": normals.unsqueeze(0),
+        "cls": [asset.cls],
+        "model_input": [ModelInput(asset=asset)],
+        "scene": scene,
+    }
 
 
 def run_inference(batch: dict, params: GenParams, request_id: str,
@@ -369,8 +383,11 @@ def run_inference(batch: dict, params: GenParams, request_id: str,
         progress_callback(10, "model sampling")
 
     with seeded_rng(params.seed), torch.inference_mode():
+        # The skin stays at the sampled points: export interpolates only the
+        # few influences per vertex it writes (see export_samples).
         preds: List[TokenRigResult] = state.model.predict_step(
             batch, make_asset=True, progress_callback=progress_callback or None,
+            interpolate_skin=False,
         )["results"]
 
     preds = [
@@ -380,26 +397,59 @@ def run_inference(batch: dict, params: GenParams, request_id: str,
     ]
 
     del batch
-    if config.EMPTY_CACHE_AFTER_INFERENCE and torch.cuda.is_available():
-        gc.collect()
-        torch.cuda.empty_cache()
+    # The memory is released after the reply is sent (:func:`release_memory`),
+    # not here, where it would delay the export and the response.
+    state.release_pending = True
 
     cancellation.raise_if_cancelled()
     return preds
 
 
+def release_memory() -> None:
+    """Hand cached memory back after a request (a worker's ``idle`` hook).
+
+    Runs once the reply has been sent, so it costs the next request nothing
+    unless that one is already waiting.
+    """
+    if not state.release_pending:
+        return
+    state.release_pending = False
+    if config.EMPTY_CACHE_AFTER_INFERENCE and torch.cuda.is_available():
+        started = time.perf_counter()
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("memory released in %.0fms", (time.perf_counter() - started) * 1000)
+
+
+GROUP_PER_VERTEX = 4  # influences per vertex in the exported GLB
+
+
+def _skin_device() -> Optional[str]:
+    """Where to interpolate the skin: the model's CUDA device, else CPU threads."""
+    return DEVICE if DEVICE.startswith("cuda") and torch.cuda.is_available() else None
+
+
 def export_samples(preds: list, params: GenParams, request_id: str,
                    cancellation: Cancellation, progress_callback,
-                   tmp_output_dir: Path) -> list[bytes]:
+                   tmp_output_dir: Optional[Path] = None, scene=None,
+                   source=None) -> list[bytes]:
     """Stage 3 (CPU): export each predicted asset to a GLB (sample ``i`` under
-    ``derive_seed(params.seed, i)``: the rig transfer subsamples points)."""
-    from src.data.seeding import derive_seed, seeded_rng
-    from src.rig_package.glb_io import InputLimits
-    from src.rig_package.parser.glb import transfer_rigging
+    ``derive_seed(params.seed, i)``: the rig transfer subsamples points).
 
-    limits = InputLimits.from_env()
+    ``scene`` is the input already parsed by :func:`prepare_inputs`; without it
+    ``source`` (an :class:`Upload` or a path, else the asset's own path) is
+    parsed once here. ``tmp_output_dir`` is unused (GLBs are built in memory)
+    and kept for callers.
+    """
+    from src.data.seeding import derive_seed, seeded_rng
+    from src.rig_package.glb_io import InputLimits, SparseSkin
+    from src.rig_package.parser.glb import transfer_rigging
+    from src.rig_package.skin_interp import interpolate_top_k
+
     sample_count = max(len(preds), 1)
     glbs: list[bytes] = []
+    if scene is None and preds:
+        scene = _load_input(source or preds[0].asset.path, InputLimits.from_env())
 
     for sample_idx, pred in enumerate(preds):
         cancellation.raise_if_cancelled()
@@ -407,24 +457,33 @@ def export_samples(preds: list, params: GenParams, request_id: str,
 
         asset = pred.asset
         assert asset is not None
+        # Merging a collapsed joint's skin into its ancestor commutes with the
+        # (linear) interpolation onto the mesh, so with the skin still at the
+        # sampled points, it is merged there, on far fewer rows.
         collapsed_joints = asset.collapse_near_parent_joints()
         if collapsed_joints:
             logger.info("[%s] sample=%d collapsed near-parent skeleton joints: %s",
                         request_id, sample_idx, ", ".join(collapsed_joints))
 
-        sample_out_path = tmp_output_dir / f"sample_{sample_idx}.glb"
-        sample_out_path.parent.mkdir(parents=True, exist_ok=True)
+        skin = None
+        sampled_skin = (asset.sampled_vertex_groups or {}).get("skin")
+        if asset.skin is None and sampled_skin is not None:
+            ids, weights = interpolate_top_k(
+                asset.vertices, asset.sampled_vertices, sampled_skin,
+                top_k=GROUP_PER_VERTEX, device=_skin_device())
+            skin = SparseSkin(ids, weights)
+
         with seeded_rng(derive_seed(params.seed, sample_idx)):
-            transfer_rigging(
+            glb = transfer_rigging(
                 source_asset=asset,
-                target_path=asset.path,
-                export_path=str(sample_out_path),
-                group_per_vertex=4,
+                scene=scene,
+                skin=skin,
+                export_path=None,  # build the GLB in memory
+                group_per_vertex=GROUP_PER_VERTEX,
                 # Shift the whole scene so its bottom sits at Z=0.
                 auto_ground=True,
-                limits=limits,
             )
-        glbs.append(sample_out_path.read_bytes())
+        glbs.append(glb)
         cancellation.raise_if_cancelled()
         _report_sample_progress(progress_callback, sample_count, sample_idx, "exported")
 
@@ -473,24 +532,19 @@ def run_job(params: dict, upload: bytes, cancellation: Cancellation, progress=No
     logger.info("[%s] seed=%d num_samples=%d", request_id, gen.seed, gen.num_samples)
     reporter = ProgressReporter(request_id, cancellation, progress)
 
-    tmp_input_dir = Path(tempfile.mkdtemp(prefix="skintokens_input_"))
-    tmp_output_dir = Path(tempfile.mkdtemp(prefix="skintokens_output_"))
-    # The client's filename is never used as a path: only its suffix is.
-    input_path = tmp_input_dir / f"input{suffix}"
-    try:
-        input_path.write_bytes(upload)
-        del upload
-        batch = STAGES["prepare"](input_path, gen, request_id, cancellation, reporter.report)
-        preds = STAGES["infer"](batch, gen, request_id, cancellation, reporter.report)
-        del batch
-        glbs = STAGES["export"](preds, gen, request_id, cancellation, reporter.report,
-                                tmp_output_dir)
-        del preds
-        reporter.report(100, "complete")
-        return glbs
-    finally:
-        shutil.rmtree(tmp_input_dir, ignore_errors=True)
-        shutil.rmtree(tmp_output_dir, ignore_errors=True)
+    # Parsed straight from memory. The client's filename is used for nothing:
+    # only its (validated) suffix, which tells GLB from glTF.
+    source = Upload(upload, f"input{suffix}")
+    del upload
+    batch = STAGES["prepare"](source, gen, request_id, cancellation, reporter.report)
+    scene = batch.pop("scene", None) if isinstance(batch, dict) else None
+    preds = STAGES["infer"](batch, gen, request_id, cancellation, reporter.report)
+    del batch
+    glbs = STAGES["export"](preds, gen, request_id, cancellation, reporter.report,
+                            scene=scene, source=source)
+    del preds, scene, source
+    reporter.report(100, "complete")
+    return glbs
 
 
-SERVICE = ServiceSpec("skintokens", load, run_job)
+SERVICE = ServiceSpec("skintokens", load, run_job, release_memory)

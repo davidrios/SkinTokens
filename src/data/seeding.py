@@ -43,7 +43,8 @@ def enable_deterministic_kernels() -> None:
 
 def derive_seed(seed: int, index: int) -> int:
     """An independent seed for sample ``index`` of a request seeded ``seed``."""
-    return int(np.random.SeedSequence([seed, index]).generate_state(1, np.uint64)[0] & MAX_SEED)
+    # int() first: on numpy 1.x, ``np.uint64 & int`` promotes to float64 and fails.
+    return int(np.random.SeedSequence([seed, index]).generate_state(1, np.uint64)[0]) & MAX_SEED
 
 
 @contextmanager
