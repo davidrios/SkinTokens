@@ -64,7 +64,7 @@ class RequestTrace:
     """Timestamped lines of one request, kept in memory for its failure dump
     (the newest :attr:`MAX_LINES`)."""
 
-    MAX_LINES = 5000
+    MAX_LINES = 20000
 
     def __init__(self) -> None:
         self._lines: deque[str] = deque(maxlen=self.MAX_LINES)

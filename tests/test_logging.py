@@ -64,3 +64,33 @@ def test_rejections_and_client_errors_write_no_dump(tmp_path, monkeypatch):
     bad.save()
     assert bad.status == "error" and not bad.server_error
     assert not (tmp_path / "dump").exists()
+
+
+def test_cancellation_and_benign_disconnect_write_no_dump(tmp_path, monkeypatch):
+    import asyncio
+    monkeypatch.setenv("SKINTOKENS_OUTPUT_ROOT", str(tmp_path))
+    cancelled = serve._RequestRecord("c1", None)
+    cancelled.fail(asyncio.CancelledError())
+    cancelled.save()
+    assert cancelled.status == "cancelled" and not cancelled.server_error
+    disconnected = serve._RequestRecord("d1", None)
+    disconnected.fail(RuntimeError("cannot call 'send' once 'close' has already been called"))
+    disconnected.save()
+    assert disconnected.status == "disconnected" and not disconnected.server_error
+    assert not (tmp_path / "dump").exists()
+
+
+def test_generation_cancelled_is_cancelled_not_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("SKINTOKENS_OUTPUT_ROOT", str(tmp_path))
+    record = serve._RequestRecord("g1", None)
+    record.fail(serve.GenerationCancelled("client requested cancellation"))
+    record.save()
+    assert record.status == "cancelled" and not record.server_error
+    assert record.traceback is None
+    assert not (tmp_path / "dump").exists()
+
+
+def test_request_id_is_hhmmss_plus_16_hex():
+    import re
+    rid = serve.new_request_id()
+    assert re.fullmatch(r"\d{6}-[0-9a-f]{16}", rid)

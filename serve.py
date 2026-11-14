@@ -60,6 +60,16 @@ from src.server.worker import GenerationCancelled
 WORKER_SPEC = "src.server.pipeline:SERVICE"
 
 
+def new_request_id() -> str:
+    """A per-request id for logs, failure dumps and client responses.
+
+    The local ``HHMMSS`` prefix (same clock as the dump date directories) makes a
+    request's time of day visible at a glance, and the 64-bit random suffix
+    (16 hex chars) keeps the birthday-collision odds negligible even over
+    millions of requests, so two concurrent requests never share a dump dir."""
+    return f"{time.strftime('%H%M%S', time.localtime())}-{uuid.uuid4().hex[:16]}"
+
+
 # --------------------------------------------------------------------------- #
 # Global state
 # --------------------------------------------------------------------------- #
@@ -320,6 +330,17 @@ async def health():
 _CLIENT_ERRORS = (ValueError, WebSocketDisconnect)
 
 
+def _is_benign_ws_disconnect(exc: BaseException) -> bool:
+    if isinstance(exc, WebSocketDisconnect):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc).lower()
+        return (
+            "cannot call" in msg and "send" in msg and "close" in msg
+        ) or "response already completed" in msg
+    return False
+
+
 class _RequestRecord:
     """One request's details: the source of its single summary log line and,
     when the server fails on it, of its dump (``dump/<date>/<request_id>/``: upload as
@@ -346,10 +367,17 @@ class _RequestRecord:
         self._trace_token = bind_trace(self.trace)
 
     def fail(self, exc: BaseException) -> None:
-        self.status = "error"
+        if isinstance(exc, (asyncio.CancelledError, GenerationCancelled)):
+            status = "cancelled"
+        elif _is_benign_ws_disconnect(exc):
+            status = "disconnected"
+        else:
+            status = "error"
+        self.status = status
         self.error = f"{type(exc).__name__}: {exc}"
-        self.server_error = not isinstance(exc, _CLIENT_ERRORS)
-        self.traceback = "".join(traceback.format_exception(exc))
+        self.server_error = status == "error" and not isinstance(exc, _CLIENT_ERRORS)
+        # Formatted now, so the record does not keep the failed frames alive.
+        self.traceback = "".join(traceback.format_exception(exc)) if self.server_error else None
 
     def reject(self, message: str) -> None:
         """A request refused with an error frame (busy, loading, malformed,
@@ -420,7 +448,7 @@ async def ws_generate(ws: WebSocket):
       server -> {"stage": "done", "glb_size": N, ...}
       server -> <binary: GLB data>
     """
-    request_id = uuid.uuid4().hex[:8]
+    request_id = new_request_id()
     record = _RequestRecord(request_id, ws.client)
     cancellation = None
     generation_task = None
@@ -560,11 +588,11 @@ async def ws_generate(ws: WebSocket):
         record.status = "done"
         await ws.close()
 
-    except WebSocketDisconnect:
-        record.status = "disconnected"
-    except GenerationCancelled as e:
-        record.status = "cancelled"
-        record.error = str(e)
+    except asyncio.CancelledError as e:
+        record.fail(e)
+        raise
+    except (WebSocketDisconnect, GenerationCancelled) as e:
+        record.fail(e)
     except Exception as e:
         record.fail(e)
         try:
