@@ -1,7 +1,7 @@
 """SkinTokens / TokenRig WebSocket client — stream progress and save a rigged GLB.
 
 Example:
-    python skintokens_client.py --input assets/character.obj --output out.glb
+    python skintokens_client.py --input assets/character.glb --output out.glb
     python skintokens_client.py --input model.glb --server http://HOST:8087
 
 Requires the ``websockets`` package.
@@ -160,7 +160,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="SkinTokens / TokenRig WebSocket client with live progress"
     )
-    parser.add_argument("--input", required=True, help="Input 3D file path (GLB/GLTF/OBJ)")
+    parser.add_argument("--input", required=True, help="Input 3D file path (GLB/GLTF)")
     parser.add_argument(
         "--output",
         default=None,

@@ -72,18 +72,6 @@ def test_untrusted_gltf_images_are_never_read_or_exported(secret, tmp_path):
         assert SECRET not in out.read_bytes()
 
 
-def test_untrusted_obj_cannot_reference_outside_files(secret, tmp_path):
-    secret_path, upload = secret
-    (tmp_path / "evil.mtl").write_text(f"newmtl m\nmap_Kd {secret_path}\n")
-    obj = upload / "evil.obj"
-    obj.write_text(f"mtllib ../evil.mtl\nmtllib {tmp_path / 'evil.mtl'}\nusemtl m\n"
-                   "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 2/2 3/3\n")
-    asset = GlbParser.load(str(obj), limits=LIMITS)
-    out = tmp_path / "out.glb"
-    transfer_rigging(_rig(asset), str(obj), str(out), limits=LIMITS)
-    assert SECRET not in out.read_bytes()
-
-
 @pytest.mark.parametrize("limits, match", [
     (InputLimits(max_vertices=2), "vertex count"),
     (InputLimits(max_faces=0), "triangle count"),

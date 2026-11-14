@@ -74,7 +74,7 @@ def test_progress_reaches_the_request_callback():
     seen = []
 
     async def scenario(pool):
-        await serve._generate(b"x", "m.obj", make_params(), "req",
+        await serve._generate(b"x", "m.glb", make_params(), "req",
                               lambda p, s, e: seen.append((p, s)))
 
     run_with_pool(scenario, size=1)
@@ -144,7 +144,7 @@ def test_generate_cancellation_raises_with_reason():
         cancel = serve.CancellationToken()
         busy = asyncio.create_task(pool.submit(sleep_job(0.5), b""))
         await asyncio.sleep(0.05)
-        task = asyncio.create_task(serve._generate(b"d", "m.obj", make_params(), "req", None, cancel))
+        task = asyncio.create_task(serve._generate(b"d", "m.glb", make_params(), "req", None, cancel))
         await asyncio.sleep(0.05)
         assert serve.state.active_jobs == 1
         cancel.cancel("client requested cancellation")

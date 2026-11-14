@@ -24,7 +24,7 @@ class LazyAsset(ABC):
 
 @dataclass
 class GlbLazyAsset(LazyAsset):
-    """Load .glb/.gltf/.obj natively (no bpy)."""
+    """Load .glb/.gltf natively (no bpy)."""
     
     def load(self) -> 'Asset':
         from ..rig_package.parser.glb import GlbParser
@@ -35,7 +35,7 @@ class GlbLazyAsset(LazyAsset):
 
 @dataclass
 class UntrustedGlbLazyAsset(LazyAsset):
-    """Load an uploaded .glb/.gltf/.obj with resource limits and no external files.
+    """Load an uploaded .glb/.gltf with resource limits and no external files.
 
     Limits come from ``SKINTOKENS_MAX_UPLOAD_MB`` and ``SKINTOKENS_INPUT_*`` (see
     ``rig_package/glb_io/limits.py``).
@@ -140,7 +140,7 @@ class Datapath(ConfigSpec):
     # weight
     cls_weight: Optional[List[float]]=None
     
-    # native glb/gltf/obj loader
+    # native glb/gltf loader
     loader: type[LazyAsset]=GlbLazyAsset
     
     # data name

@@ -120,7 +120,7 @@ python demo.py --input examples/
 python demo.py --input examples/ --output results/
 ```
 
-Inputs may be `.glb`, `.gltf` (with embedded or adjacent resources) or `.obj`; any existing skin/skeleton in the input is ignored, and results are always a skinned-mesh-only `.glb` (materials and textures are not exported). Only triangle geometry is processed (triangle strips/fans are triangulated); points and lines are ignored, and files without triangles are rejected. Geometry I/O is native Python/NumPy (`src/rig_package/glb_io`) — Blender (`bpy`) is not required, and FBX is not supported (convert FBX to GLB first). Draco/meshopt-compressed GLBs and the `EXT_mesh_gpu_instancing` extension are not supported; expand instances before importing.
+Inputs may be `.glb` or `.gltf` (with embedded or adjacent resources); any existing skin/skeleton in the input is ignored, and results are always a skinned-mesh-only `.glb` (materials and textures are not exported). Only triangle geometry is processed (triangle strips/fans are triangulated); points and lines are ignored, and files without triangles are rejected. Geometry I/O is native Python/NumPy (`src/rig_package/glb_io`) — Blender (`bpy`) is not required, and FBX is not supported (convert FBX to GLB first). Draco/meshopt-compressed GLBs and the `EXT_mesh_gpu_instancing` extension are not supported; expand instances before importing.
 
 ### Docker (NVIDIA GPU)
 

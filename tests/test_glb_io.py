@@ -191,17 +191,3 @@ def test_triangle_strip_and_fan_export_as_triangles(tmp_path, mode):
     transfer_rigging(predicted, str(path), str(out))
     np.testing.assert_array_equal(GlbParser.load(str(out)).faces, asset.faces)
     assert _gltf_json(out)['meshes'][0]['primitives'][0].get('mode', 4) == 4
-
-
-def test_obj_input_loads_and_rigs(tmp_path):
-    obj = tmp_path / "quad.obj"
-    obj.write_text("v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3\nf 1 3 4\n")
-    asset = GlbParser.load(str(obj))
-    assert asset.N == 4 and asset.F == 2
-    # OBJ is Y-up like glTF: (x, y, z) -> Blender (x, -z, y)
-    np.testing.assert_allclose(np.sort(asset.vertices[:, 2]), [0, 0, 1, 1])
-    predicted = Asset.from_data(vertices=asset.vertices, joints=np.zeros((1, 3)), parents=np.array([-1]),
-                                joint_names=["root"], skin=np.ones((asset.N, 1), np.float32))
-    out = tmp_path / "quad.glb"
-    transfer_rigging(predicted, str(obj), str(out))
-    assert _read_rig(out)[0] == ["root"]

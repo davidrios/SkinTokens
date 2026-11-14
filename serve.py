@@ -8,7 +8,7 @@ a time, so up to ``SKINTOKENS_WORKERS`` requests are parsed, sampled on the GPU
 and exported fully in parallel. Further requests wait for a free worker in
 FIFO order and get a once-per-second queue heartbeat meanwhile.
 
-Clients submit a 3D file (GLB/GLTF/OBJ) and receive a rigged GLB over WebSocket.
+Clients submit a 3D file (GLB/GLTF) and receive a rigged GLB over WebSocket.
 See ``src/server/pipeline.py`` for the model side (and a note on why results
 are non-deterministic).
 
@@ -267,7 +267,7 @@ async def health():
 async def ws_generate(ws: WebSocket):
     """
     WebSocket protocol:
-      client -> {"filename": "model.obj", ...params}
+      client -> {"filename": "model.glb", ...params}
       client -> <binary: file data>
       client -> {"type": "cancel"}
       server -> {"stage": "queued"|"processing"|"done"|"cancelled"|"error", ...}
@@ -293,7 +293,7 @@ async def ws_generate(ws: WebSocket):
             await ws.close()
             return
 
-        filename = req.pop("filename", "input.obj")
+        filename = req.pop("filename", "input.glb")
         if req.get("use_skeleton"):
             logger.warning("[%s] rejected: use_skeleton is no longer supported", request_id)
             await ws.send_json({"stage": "error", "message":

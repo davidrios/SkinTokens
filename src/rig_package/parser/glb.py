@@ -1,6 +1,6 @@
-"""Native GLB/GLTF/OBJ parser and rigged-GLB exporter (no bpy, no FBX).
+"""Native GLB/GLTF parser and rigged-GLB exporter (no bpy, no FBX).
 
-Assets use Blender's Z-up convention, which the model was trained on: glTF/OBJ
+Assets use Blender's Z-up convention, which the model was trained on: glTF
 Y-up coordinates are converted with ``(x, y, z) -> (x, -z, y)`` on load and back
 on export, exactly like Blender's importers/exporters. Geometry is expressed in
 world space (skinned meshes in bind space), so ``matrix_world`` is identity.
@@ -64,7 +64,7 @@ class GlbParser(AbstractParser):
 
     @classmethod
     def load(cls, filepath: str, limits: Optional[InputLimits]=None, **kwargs) -> Asset:
-        """Load a .glb/.gltf/.obj file as a plain mesh (merged mesh parts).
+        """Load a .glb/.gltf file as a plain mesh (merged mesh parts).
 
         Any skin, joints or animation in the file are ignored: rigs are output
         only. Pass ``limits`` for untrusted (uploaded) files; see ``glb_io.limits``.
@@ -84,64 +84,14 @@ class GlbParser(AbstractParser):
 
     @classmethod
     def export(cls, asset: Asset, filepath: str, **kwargs):
-        """Export .obj, .ply or .glb (skinned when the asset has joints and skin)."""
+        """Export .ply or .glb (skinned when the asset has joints and skin)."""
         ext = os.path.splitext(filepath)[1].lower()
-        if ext == '.obj':
-            cls.export_obj(asset, filepath, **kwargs)
-        elif ext == '.ply':
+        if ext == '.ply':
             cls.export_ply(asset, filepath, **kwargs)
         elif ext == '.glb':
             cls.export_asset(asset, filepath, **kwargs)
         else:
-            raise ValueError(f"Unsupported export format: {ext}; expected .glb, .obj or .ply")
-
-    @classmethod
-    def export_obj(
-        cls,
-        asset: Asset,
-        filepath: str,
-        precision: int=6,
-        use_pc: bool=False,
-        use_normal: bool=False,
-        use_skeleton: bool=False,
-        normal_size: float=0.01,
-    ):
-        """Export the asset as an .obj file. This will ignore skeleton and skinning."""
-        asset._build_bias()
-        if asset.vertices is None or asset.vertex_bias is None:
-            raise ValueError("do not have vertices or vertex_bias")
-        if use_normal and asset.vertex_normals is None:
-            raise ValueError("use_normal is True but do not have vertex_normals")
-        if use_skeleton:
-            raise NotImplementedError()
-        if not filepath.lower().endswith('.obj'):
-            filepath += ".obj"
-        faces = asset.faces
-        mesh_names = asset.mesh_names
-        if mesh_names is None:
-            mesh_names = [f"mesh_{i}" for i in range(asset.P)]
-        cls._safe_make_dir(filepath)
-        lines = []
-        tot = 0
-        for i, mesh_name in enumerate(mesh_names):
-            lines.append(f'o {mesh_name}\n')
-            if use_normal:
-                s = asset.get_vertex_slice(i)
-                for v, n in zip(asset.vertices[s], asset.vertex_normals[s]): # type: ignore
-                    vv = v + n * normal_size
-                    lines.append(f'v {v[0]:.{precision}f} {v[2]:.{precision}f} {-v[1]:.{precision}f}\n')
-                    lines.append(f'v {vv[0]:.{precision}f} {vv[2]:.{precision}f} {-vv[1]:.{precision}f}\n')
-                    lines.append(f'v {vv[0]:.{precision}f} {vv[2]:.{precision}f} {-vv[1]+0.000001:.{precision}f}\n')
-                    lines.append(f"f {tot+1} {tot+2} {tot+3}\n")
-                    tot += 3
-            else:
-                for v in asset.vertices[asset.get_vertex_slice(i)]:
-                    lines.append(f'v {v[0]:.{precision}f} {v[2]:.{precision}f} {-v[1]:.{precision}f}\n')
-                if faces is not None and not use_pc:
-                    for f in faces[asset.get_face_slice(i)]:
-                        lines.append(f"f {f[0]+1} {f[1]+1} {f[2]+1}\n")
-        with open(filepath, 'w') as file:
-            file.writelines(lines)
+            raise ValueError(f"Unsupported export format: {ext}; expected .glb or .ply")
 
     @classmethod
     def export_ply(

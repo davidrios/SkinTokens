@@ -47,7 +47,7 @@ MODEL_CKPT = os.environ.get(
 )
 HF_PATH = os.environ.get("SKINTOKENS_HF_PATH") or None
 STARTUP_HEARTBEAT_SEC = max(1.0, float(os.environ.get("SKINTOKENS_STARTUP_HEARTBEAT_SEC", "15")))
-SUPPORTED_EXT = {".obj", ".glb", ".gltf"}
+SUPPORTED_EXT = {".glb", ".gltf"}
 
 # Worker processes, each with its own copy of the model on the GPU; up to this
 # many requests run fully in parallel (parse, inference and export).

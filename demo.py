@@ -49,7 +49,7 @@ def load_model(model_ckpt: str, hf_path: Optional[str], device: Optional[str] = 
     return ("Model loaded.", model_ckpt)
 
 
-SUPPORTED_EXT = {".obj", ".glb", ".gltf"}
+SUPPORTED_EXT = {".glb", ".gltf"}
 
 
 def collect_files(input_path: Path) -> List[Path]:

@@ -6,12 +6,11 @@ A mesh that happens to be skinned is read in its bind pose (its vertices as
 stored; glTF ignores a skinned mesh's node transform).
 
 Callers that need Blender's Z-up convention (the space the model was trained
-in) convert with :data:`Y_UP_TO_Z_UP`, exactly like Blender's glTF/OBJ importers.
+in) convert with :data:`Y_UP_TO_Z_UP`, exactly like Blender's glTF importer.
 """
 from __future__ import annotations
 
 import io
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -22,11 +21,11 @@ from .builder import ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER, Builder
 from .document import Document, malformed_as_value_error, node_local_matrix
 from .limits import InputLimits, check_limit
 
-# glTF/OBJ (x, y, z) Y-up  ->  Blender (x, -z, y) Z-up.
+# glTF (x, y, z) Y-up  ->  Blender (x, -z, y) Z-up.
 Y_UP_TO_Z_UP = np.array([[1., 0., 0.], [0., 0., -1.], [0., 1., 0.]])
 Z_UP_TO_Y_UP = Y_UP_TO_Z_UP.T
 
-SUPPORTED_SCENE_EXT = ('.glb', '.gltf', '.obj')
+SUPPORTED_SCENE_EXT = ('.glb', '.gltf')
 
 
 def _is_triangle_primitive(prim: dict) -> bool:
@@ -221,60 +220,14 @@ def _triangulate(idx: np.ndarray, mode: int) -> np.ndarray:
 # ---------------------------------------------------------------------- #
 # loading
 # ---------------------------------------------------------------------- #
-def _sandboxed_resolver(filepath):
-    """trimesh resolver that only serves plain file names from the OBJ's own folder.
-
-    trimesh's default resolver follows absolute paths and ``..`` in ``mtllib`` /
-    texture references, which would let an uploaded OBJ read server files.
-    """
-    from trimesh.resolvers import FilePathResolver
-
-    class SandboxedResolver(FilePathResolver):
-        def get(self, name: str):
-            name = name.strip()
-            if not name or os.path.isabs(name) or Path(name).drive or any(
-                    part in ('..', '') for part in name.replace('\\', '/').split('/')):
-                raise ValueError(f'OBJ resource reference not allowed: {name!r}')
-            parent = os.path.realpath(self.parent)
-            path = os.path.realpath(os.path.join(parent, name))
-            if os.path.commonpath([parent, path]) != parent:
-                raise ValueError(f'OBJ resource reference not allowed: {name!r}')
-            with open(path, 'rb') as f:
-                return f.read()
-
-        def namespaced(self, namespace: str):
-            raise ValueError('OBJ resource namespaces are not allowed')
-
-    return SandboxedResolver(str(filepath))
-
-
-def obj_to_glb_bytes(filepath, limits: Optional[InputLimits] = None) -> bytes:
-    """Convert an OBJ (with its MTL/textures) to GLB bytes via trimesh; no Blender.
-
-    With ``limits`` the OBJ is untrusted: its size is checked and its MTL/texture
-    references may only name files next to it.
-    """
-    import trimesh
-    kwargs = {}
-    if limits is not None:
-        check_limit(Path(filepath).stat().st_size, limits.max_file_bytes, 'file size (bytes)')
-        kwargs['resolver'] = _sandboxed_resolver(filepath)
-    scene = trimesh.load(str(filepath), force='scene', process=False, maintain_order=True, **kwargs)
-    if not scene.geometry:
-        raise ValueError(f'No geometry found in {filepath}')
-    return scene.export(file_type='glb')
-
-
 def load_scene(filepath, limits: Optional[InputLimits] = None) -> Scene:
-    """Load a .glb/.gltf/.obj scene. Pass ``limits`` for untrusted (uploaded) input."""
+    """Load a .glb/.gltf scene. Pass ``limits`` for untrusted (uploaded) input."""
     path = Path(filepath)
     if not path.exists():
         raise RuntimeError(f'file does not exist: {filepath}')
     suffix = path.suffix.lower()
     if suffix in ('.glb', '.gltf'):
         return Scene(Document(path, limits=limits))
-    if suffix == '.obj':
-        return Scene(Document(obj_to_glb_bytes(path, limits), name=path.stem + '.glb', limits=limits))
     if suffix == '.fbx':
         raise ValueError('FBX input is not supported; convert the file to GLB first')
     raise ValueError(f'unsupported type: {suffix}; expected one of {SUPPORTED_SCENE_EXT}')
