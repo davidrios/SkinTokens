@@ -20,9 +20,19 @@ Environment variables:
     SKINTOKENS_MODEL_CKPT     Path to the model checkpoint
     SKINTOKENS_HF_PATH        Optional HuggingFace model path
     SKINTOKENS_DEVICE         Device override (default: cuda if available)
+    SKINTOKENS_MAX_QUEUE      Requests that may wait for a worker (default 16);
+                              more are refused with "server busy"
+    SKINTOKENS_HEADER_TIMEOUT_SEC / SKINTOKENS_UPLOAD_TIMEOUT_SEC
+                              Time a client has to send its header (30) / file (300)
+    SKINTOKENS_MAX_UPLOAD_MB, SKINTOKENS_INPUT_*  Upload size and geometry limits
+                              (src/rig_package/glb_io/limits.py)
+
+The server has no authentication and accepts WebSocket connections from any
+origin: expose it only on a trusted network or behind an authenticating proxy.
 """
 
 import argparse
+import json
 import os
 import asyncio
 import logging
@@ -61,6 +71,9 @@ class ServerState:
     ready: bool = False
     loaded_at: float = 0.0
     active_jobs: int = 0
+    # Requests past their header, holding (or receiving) an upload: running,
+    # waiting for a worker or still uploading. Capped by ``_admission_limit``.
+    admitted: int = 0
 
     @property
     def busy(self) -> bool:
@@ -97,6 +110,42 @@ class CancellationToken:
 # --------------------------------------------------------------------------- #
 # Generation
 # --------------------------------------------------------------------------- #
+def _parse_text_message(text) -> dict:
+    """A client's JSON text message as a dict, bounded in size before parsing
+    (the gateway's event loop parses it, so it must stay cheap)."""
+    if not isinstance(text, str):
+        raise ValueError("expected a JSON text message")
+    if len(text) > config.MAX_TEXT_MESSAGE_BYTES:
+        raise ValueError(f"JSON message too large (max {config.MAX_TEXT_MESSAGE_BYTES} bytes)")
+    try:
+        message = json.loads(text)
+    except (ValueError, RecursionError):
+        raise ValueError("invalid JSON message") from None
+    if not isinstance(message, dict):
+        raise ValueError("expected a JSON object")
+    return message
+
+
+def _request_filename(req: dict) -> str:
+    filename = req.pop("filename", "input.glb")
+    if not isinstance(filename, str) or len(filename) > config.MAX_FILENAME_CHARS:
+        raise ValueError(f"filename must be a string of at most {config.MAX_FILENAME_CHARS} characters")
+    return filename
+
+
+def _admission_limit() -> int:
+    return config.WORKERS + config.MAX_QUEUE
+
+
+def _client_error_message(exc: BaseException, request_id: str) -> str:
+    """What a client is told about a failure: the message of an invalid request
+    or input (``ValueError``, including parameter validation), else only the
+    error type; details of internal errors stay in the server log."""
+    if isinstance(exc, ValueError):
+        return str(exc)
+    return f"internal error ({type(exc).__name__}); request {request_id}"
+
+
 def _validate_upload(file_data: bytes, filename: str) -> str:
     """The upload's (supported) suffix; the client's filename is used for nothing else."""
     suffix = Path(str(filename)).suffix.lower()
@@ -169,7 +218,11 @@ async def _watch_ws_cancellation(ws: WebSocket, cancellation: CancellationToken,
     """Return True for an explicit cancel message, False for a disconnect."""
     try:
         while True:
-            message = await ws.receive_json()
+            try:
+                message = _parse_text_message(await ws.receive_text())
+            except (ValueError, KeyError):  # KeyError: a binary frame
+                logger.warning("[%s] ignoring invalid WebSocket message", request_id)
+                continue
             message_type = message.get("type", message.get("action", ""))
             if str(message_type).lower() in {"cancel", "interrupt"}:
                 logger.info("[%s] explicit cancellation requested", request_id)
@@ -257,6 +310,8 @@ async def health():
         "status": "ok",
         "busy": state.busy,
         "active_jobs": state.active_jobs,
+        "admitted": state.admitted,
+        "max_admitted": _admission_limit(),
         "workers": pool["workers"],
         "pool": pool,
         "queue_depth": pool["queued"],
@@ -283,38 +338,57 @@ async def ws_generate(ws: WebSocket):
     await ws.accept()
     logger.info("[%s] WebSocket connected client=%s", request_id, ws.client)
 
+    async def reject(message: str) -> None:
+        logger.warning("[%s] rejected: %s", request_id, message)
+        await ws.send_json({"stage": "error", "message": message})
+        await ws.close()
+
+    admitted = False
     try:
-        req = await ws.receive_json()
+        try:
+            header = await asyncio.wait_for(ws.receive_text(), config.HEADER_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            await reject(f"no request header within {config.HEADER_TIMEOUT_SEC}s")
+            return
+        except KeyError:  # a binary frame
+            await reject("expected a JSON request header before the file")
+            return
+        req = _parse_text_message(header)
         logger.info("[%s] WebSocket generation request received", request_id)
 
         if not state.ready or state.pool is None:
-            logger.warning("[%s] rejected: model still loading", request_id)
-            await ws.send_json({"stage": "error", "message": "model still loading"})
-            await ws.close()
+            await reject("model still loading")
             return
 
-        filename = req.pop("filename", "input.glb")
+        filename = _request_filename(req)
         if req.get("use_skeleton"):
-            logger.warning("[%s] rejected: use_skeleton is no longer supported", request_id)
-            await ws.send_json({"stage": "error", "message":
-                                "use_skeleton is no longer supported; inputs are meshes and "
-                                "the skeleton is always generated"})
-            await ws.close()
+            await reject("use_skeleton is no longer supported; inputs are meshes and "
+                         "the skeleton is always generated")
             return
-
-        try:
-            file_data = await ws.receive_bytes()
-        except Exception as e:
-            logger.warning("[%s] invalid file: %s", request_id, e)
-            await ws.send_json({"stage": "error", "message": f"invalid file: {e}"})
-            await ws.close()
-            return
-
+        # Validated before the upload is received, so a bad request costs no upload.
         # Unknown fields (e.g. the sampling knobs older clients still send) are
         # ignored. A request without a seed gets one here, so it can be reported
         # with the result and the run reproduced.
         params = GenParams(**{k: v for k, v in req.items() if k in GenParams.model_fields}).with_seed()
-        logger.info("[%s] file decoded bytes=%d filename=%s params=%s",
+
+        # Every admitted request holds its upload in this process until a
+        # worker takes it, so their number is capped.
+        if state.admitted >= _admission_limit():
+            await reject(f"server busy: {state.admitted} requests running or queued; retry later")
+            return
+        state.admitted += 1
+        admitted = True
+
+        try:
+            file_data = await asyncio.wait_for(ws.receive_bytes(), config.UPLOAD_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            await reject(f"file not received within {config.UPLOAD_TIMEOUT_SEC}s")
+            return
+        except KeyError:  # a text frame
+            await reject("invalid file: expected a binary message")
+            return
+
+        logger.info("[%s] file decoded bytes=%d filename=%r params=%s",
                     request_id, len(file_data), filename, params.model_dump())
 
         cancellation = CancellationToken()
@@ -395,7 +469,7 @@ async def ws_generate(ws: WebSocket):
         try:
             if outbox is not None:
                 await outbox.flush()
-            await ws.send_json({"stage": "error", "message": str(e)})
+            await ws.send_json({"stage": "error", "message": _client_error_message(e, request_id)})
             await ws.close()
         except Exception:
             pass
@@ -411,6 +485,8 @@ async def ws_generate(ws: WebSocket):
                 await asyncio.shield(generation_task)
         if outbox is not None:
             await outbox.close()
+        if admitted:
+            state.admitted -= 1
 
 
 # --------------------------------------------------------------------------- #

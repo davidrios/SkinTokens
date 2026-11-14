@@ -37,6 +37,10 @@ class InputLimits:
     # total mesh vertices / triangles over all mesh instances
     max_vertices: int = 2_000_000
     max_faces: int = 4_000_000
+    # all nodes (each costs a transform in the hierarchy walk, mesh or not).
+    # Rigged characters have a few hundred nodes at most; a few thousand
+    # bounds the walk to well under a second while leaving ~50x headroom.
+    max_nodes: int = 4096
     # mesh nodes (instancing one mesh many times multiplies its vertices)
     max_mesh_instances: int = 4096
     # primitives summed over mesh instances (bounds per-primitive work)

@@ -28,6 +28,7 @@ def _quiet_logs():
 def fresh_state():
     serve.state.pool = None
     serve.state.active_jobs = 0
+    serve.state.admitted = 0
     serve.state.ready = True
     yield
     serve.state.pool = None

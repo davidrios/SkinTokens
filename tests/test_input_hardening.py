@@ -221,3 +221,206 @@ def test_serve_rejects_oversized_upload(monkeypatch):
     monkeypatch.setattr(serve, "MAX_UPLOAD_BYTES", 4)
     with pytest.raises(ValueError, match="too large"):
         asyncio.run(serve._generate(b"12345", "model.glb", serve.GenParams(), "req"))
+
+
+def _gltf_doc(path: Path) -> dict:
+    return json.loads(_gltf(path).read_text())
+
+
+def _load_doc(path: Path, doc: dict, limits=LIMITS):
+    path.write_text(json.dumps(doc))
+    return GlbParser.load(str(path), limits=limits)
+
+
+def test_negative_counts_cannot_cancel_out_the_limits(tmp_path):
+    """A negative count used to subtract from the summed vertex count, so a
+    huge zero-filled accessor passed the limit (GBs from a 1 KB upload)."""
+    path = tmp_path / "neg.gltf"
+    doc = _gltf_doc(path)
+    big = 2**26 // 3
+    doc["accessors"] += [{"componentType": 5126, "count": big, "type": "VEC3"},
+                         {"componentType": 5126, "count": -big, "type": "VEC3"}]
+    doc["meshes"][0]["primitives"] = [{"attributes": {"POSITION": 1}}, {"attributes": {"POSITION": 2}}]
+    with pytest.raises(ValueError, match="Invalid glTF accessor count"):
+        _load_doc(path, doc)
+    for count in (-3, "3", True, 3.5):
+        doc = _gltf_doc(path)
+        doc["accessors"][0]["count"] = count
+        with pytest.raises(ValueError):
+            _load_doc(path, doc)
+    doc = _gltf_doc(path)
+    doc["accessors"][0]["count"] = 3.0  # an integral JSON number is a count
+    assert _load_doc(path, doc).N == 3
+
+
+def test_sparse_indices_out_of_range_rejected(tmp_path):
+    path = tmp_path / "sparse.gltf"
+    doc = _gltf_doc(path)
+    data = np.array([5], "<u4").tobytes() + TRIANGLE[:1].tobytes()
+    doc["buffers"].append({"byteLength": len(data),
+                           "uri": "data:;base64," + base64.b64encode(data).decode()})
+    doc["bufferViews"] += [{"buffer": 1, "byteLength": 4},
+                           {"buffer": 1, "byteOffset": 4, "byteLength": 12}]
+    doc["accessors"][0]["sparse"] = {"count": 1, "indices": {"bufferView": 1, "componentType": 5125},
+                                     "values": {"bufferView": 2}}
+    with pytest.raises(ValueError, match="Sparse accessor index out of range"):
+        _load_doc(path, doc)
+
+
+def test_node_count_limited_before_the_hierarchy_walk(tmp_path):
+    """Empty nodes cost no vertices but ~80 us each to walk: 1M of them (a
+    4 MB upload) took 80 s per request before the node limit."""
+    path = tmp_path / "nodes.gltf"
+    doc = _gltf_doc(path)
+    doc["nodes"] += [{}] * 10
+    doc["scenes"][0]["nodes"] = list(range(11))
+    assert _load_doc(path, doc, InputLimits(max_nodes=11)).N == 3
+    with pytest.raises(ValueError, match="node count"):
+        _load_doc(path, doc, InputLimits(max_nodes=10))
+
+
+@pytest.mark.parametrize("roots", [[0, -1], [5], [0.0], [True]])
+def test_invalid_scene_roots_rejected(tmp_path, roots):
+    path = tmp_path / "roots.gltf"
+    doc = _gltf_doc(path)
+    doc["scenes"][0]["nodes"] = roots
+    with pytest.raises(ValueError, match="scene root"):
+        _load_doc(path, doc)
+
+
+@pytest.mark.parametrize("vertices, node, match", [
+    ([[np.nan] * 3, [1, 0, 0], [0, 1, 0]], {}, "non-finite"),
+    ([[np.inf, 0, 0], [1, 0, 0], [0, 1, 0]], {}, "non-finite"),
+    ([[3e38, 0, 0], [-3e38, 0, 0], [0, 1, 0]], {}, "non-finite"),  # extent overflows float32
+    (TRIANGLE, {"matrix": [float("nan")] * 16}, "non-finite"),
+    (TRIANGLE, {"scale": [1e308] * 3}, "non-finite"),
+    (np.zeros((3, 3)), {}, "zero extent"),
+    (TRIANGLE, {"scale": [0, 0, 0]}, "zero extent"),
+])
+@pytest.mark.parametrize("limits", [None, LIMITS])
+def test_unusable_geometry_rejected(tmp_path, vertices, node, match, limits):
+    """Such geometry used to reach the model as NaN (normalization divides by the extent)."""
+    path = tmp_path / "geom.gltf"
+    doc = _gltf_doc(path)
+    data = np.asarray(vertices, "<f4").tobytes()
+    doc["buffers"][0]["uri"] = "data:;base64," + base64.b64encode(data).decode()
+    doc["nodes"][0].update(node)
+    with pytest.raises(ValueError, match=match):
+        _load_doc(path, doc, limits)
+
+
+def test_export_checks_normal_count_before_decoding(tmp_path, monkeypatch):
+    path = tmp_path / "normals.gltf"
+    doc = _gltf_doc(path)
+    doc["accessors"].append({"componentType": 5126, "count": 2**26 // 3, "type": "VEC3"})
+    doc["meshes"][0]["primitives"][0]["attributes"]["NORMAL"] = 1
+    asset = _load_doc(path, doc)
+    from src.rig_package.glb_io.document import Document
+    decoded = []
+    original = Document.accessor
+    monkeypatch.setattr(Document, "accessor", lambda self, i: decoded.append(i) or original(self, i))
+    with pytest.raises(ValueError, match="NORMAL count"):
+        transfer_rigging(_rig(asset), str(path), str(tmp_path / "out.glb"), limits=LIMITS)
+    assert 1 not in decoded
+
+
+# --------------------------------------------------------------------------- #
+# WebSocket gateway
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("text, match", [
+    ("[1, 2]", "JSON object"),
+    ('"str"', "JSON object"),
+    ("{not json", "invalid JSON"),
+    ('{"a":' * 100000 + "1" + "}" * 100000, "too large"),
+    ('{"x": "' + "a" * 70000 + '"}', "too large"),
+], ids=["list", "string", "invalid", "deep", "long"])
+def test_text_messages_bounded_and_validated(text, match):
+    with pytest.raises(ValueError, match=match):
+        serve._parse_text_message(text)
+    with pytest.raises(ValueError):
+        serve._parse_text_message(b"{}")
+    assert serve._parse_text_message('{"type": "cancel"}') == {"type": "cancel"}
+
+
+@pytest.mark.parametrize("filename", [{"a": 1}, 5, None, "a" * 256 + ".glb"])
+def test_request_filename_validated(filename):
+    with pytest.raises(ValueError, match="filename"):
+        serve._request_filename({"filename": filename})
+    assert serve._request_filename({}) == "input.glb"
+
+
+def test_internal_error_details_stay_in_the_log():
+    assert serve._client_error_message(ValueError("bad mesh"), "r1") == "bad mesh"
+    message = serve._client_error_message(RuntimeError(r"C:\srv\secret\path.py failed"), "r1")
+    assert "secret" not in message and "RuntimeError" in message and "r1" in message
+
+
+class _FakeWs:
+    """Just enough of a Starlette WebSocket for the handler's rejection paths."""
+
+    def __init__(self, *messages, hang=False):
+        self.incoming = list(messages)
+        self.hang = hang
+        self.sent = []
+        self.closed = False
+        self.client = ("test", 0)
+
+    async def accept(self):
+        pass
+
+    async def _next(self, kind):
+        if not self.incoming:
+            if self.hang:
+                await asyncio.sleep(3600)
+            raise serve.WebSocketDisconnect()
+        if not isinstance(self.incoming[0], kind):
+            raise KeyError("bytes" if kind is bytes else "text")
+        return self.incoming.pop(0)
+
+    async def receive_text(self):
+        return await self._next(str)
+
+    async def receive_bytes(self):
+        return await self._next(bytes)
+
+    async def send_json(self, message):
+        self.sent.append(message)
+
+    async def close(self):
+        self.closed = True
+
+
+def _run_ws(ws):
+    serve.state.pool = object()  # not used on the paths under test
+    asyncio.run(serve.ws_generate(ws))
+    return ws.sent[-1]["message"] if ws.sent else None
+
+
+def test_ws_idle_client_times_out(monkeypatch):
+    monkeypatch.setattr(serve.config, "HEADER_TIMEOUT_SEC", 0.05)
+    assert "no request header" in _run_ws(_FakeWs(hang=True))
+    monkeypatch.setattr(serve.config, "UPLOAD_TIMEOUT_SEC", 0.05)
+    ws = _FakeWs('{"filename": "a.glb"}', hang=True)
+    assert "not received" in _run_ws(ws)
+    assert serve.state.admitted == 0
+
+
+def test_ws_rejects_bad_frames_and_params():
+    assert "JSON request header" in _run_ws(_FakeWs(b"binary first"))
+    assert "binary message" in _run_ws(_FakeWs('{"filename": "a.glb"}', "text file"))
+    assert "JSON object" in _run_ws(_FakeWs("[1, 2, 3]"))
+    # Parameters are validated before the upload is read.
+    ws = _FakeWs('{"num_samples": 9999}', b"never read")
+    assert "num_samples" in _run_ws(ws)
+    assert ws.incoming == [b"never read"]
+    assert serve.state.admitted == 0
+
+
+def test_ws_refuses_requests_beyond_the_queue_limit(monkeypatch):
+    monkeypatch.setattr(serve.config, "WORKERS", 1)
+    monkeypatch.setattr(serve.config, "MAX_QUEUE", 2)
+    serve.state.admitted = 3
+    ws = _FakeWs('{"filename": "a.glb"}', b"upload")
+    assert "server busy" in _run_ws(ws)
+    assert ws.incoming == [b"upload"]  # refused before receiving the upload
+    assert serve.state.admitted == 3

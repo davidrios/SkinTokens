@@ -40,6 +40,17 @@ def malformed_as_value_error(name):
         raise ValueError(f'Malformed glTF {name}: {type(exc).__name__}: {exc}') from exc
 
 
+def element_count(value, what: str = 'accessor count') -> int:
+    """A glTF element count: a non-negative JSON integer (``3.0`` is accepted).
+
+    Negative counts must never reach the limit checks, which sum them: one
+    would cancel out a huge accessor elsewhere in the file.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != int(value) or value < 0:
+        raise ValueError(f'Invalid glTF {what}: {value!r}')
+    return int(value)
+
+
 def compose(t, q, s):
     """TRS (XYZW quaternion) -> 4x4 matrices, broadcasting over leading axes."""
     shape = np.broadcast_shapes(np.shape(t)[:-1], np.shape(q)[:-1], np.shape(s)[:-1])
@@ -197,7 +208,7 @@ class Document:
         if index in self._accessors:
             return self._accessors[index]
         a = self.data['accessors'][index]
-        dtype, width, count = _DTYPES[a['componentType']], _WIDTHS[a['type']], a['count']
+        dtype, width, count = _DTYPES[a['componentType']], _WIDTHS[a['type']], element_count(a['count'])
         if a['type'] in ('MAT2', 'MAT3') and np.dtype(dtype).itemsize < 4:
             raise ValueError('Padded integer matrix accessors are not supported')
         if 'bufferView' in a:
@@ -209,8 +220,11 @@ class Document:
         sparse = a.get('sparse')
         if sparse:
             ids, vals = sparse['indices'], sparse['values']
-            indices = self._view_array(ids['bufferView'], ids.get('byteOffset', 0), sparse['count'], 1, _DTYPES[ids['componentType']])[:, 0]
-            result[indices] = self._view_array(vals['bufferView'], vals.get('byteOffset', 0), sparse['count'], width, dtype)
+            sparse_count = element_count(sparse['count'], 'sparse accessor count')
+            indices = self._view_array(ids['bufferView'], ids.get('byteOffset', 0), sparse_count, 1, _DTYPES[ids['componentType']])[:, 0]
+            if len(indices) and (indices.min() < 0 or indices.max() >= count):
+                raise ValueError('Sparse accessor index out of range')
+            result[indices] = self._view_array(vals['bufferView'], vals.get('byteOffset', 0), sparse_count, width, dtype)
         if a.get('normalized') and np.issubdtype(result.dtype, np.integer):
             info = np.iinfo(result.dtype)
             result = np.maximum(result.astype(float) / info.max, -1.)

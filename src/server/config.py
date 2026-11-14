@@ -62,6 +62,17 @@ MAX_NEW_TOKENS = env_int("SKINTOKENS_MAX_NEW_TOKENS", 2048, 128, 4096)
 # allowed to reference files outside the upload itself.
 MAX_UPLOAD_MB = upload_limit_mb()
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+# WebSocket protocol bounds (the gateway is the only process clients reach).
+# Text messages (the request header, cancel messages) are small JSON objects.
+MAX_TEXT_MESSAGE_BYTES = 64 * 1024
+MAX_FILENAME_CHARS = 255
+# Seconds a client may take to send its header / its whole upload.
+HEADER_TIMEOUT_SEC = env_int("SKINTOKENS_HEADER_TIMEOUT_SEC", 30, 1, 3600)
+UPLOAD_TIMEOUT_SEC = env_int("SKINTOKENS_UPLOAD_TIMEOUT_SEC", 300, 1, 3600)
+# Requests allowed to wait for a worker beyond the ones running. Each holds its
+# upload (up to MAX_UPLOAD_MB) in the gateway, so this bounds gateway memory
+# to about (WORKERS + MAX_QUEUE) * MAX_UPLOAD_MB; further requests are refused.
+MAX_QUEUE = env_int("SKINTOKENS_MAX_QUEUE", 16, 0, 10000)
 USE_GENERATION_CACHE = env_flag("SKINTOKENS_USE_CACHE", True)
 EMPTY_CACHE_AFTER_INFERENCE = env_flag("SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE", True)
 # Fast decode: SDPA attention + static KV cache + CUDA-graph capture gives ~2x

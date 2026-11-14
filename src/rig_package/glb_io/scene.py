@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 
 from .builder import ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER, Builder
-from .document import Document, malformed_as_value_error, node_local_matrix
+from .document import Document, element_count, malformed_as_value_error, node_local_matrix
 from .limits import InputLimits, check_limit
 from ..skin_interp import clean_skin, select_top_k
 
@@ -80,6 +80,9 @@ class Scene:
                 or extension in data.get('extensionsRequired', [])
                 or any(extension in node.get('extensions', {}) for node in nodes)):
             raise ValueError(f'{extension} is not supported; expand mesh instances before importing')
+        if self.document.limits is not None:
+            # Before the hierarchy walk, whose per-node cost is the slow part.
+            check_limit(len(nodes), self.document.limits.max_nodes, 'node count')
         self.nodes = nodes
         self.parent = np.full(len(nodes), -1, dtype=int)
         for i, node in enumerate(nodes):
@@ -92,6 +95,8 @@ class Scene:
             roots = list(scenes[data.get('scene', 0)].get('nodes', []))
         else:
             roots = [int(i) for i in np.flatnonzero(self.parent < 0)]
+        if any(isinstance(r, bool) or not isinstance(r, int) or not 0 <= r < len(nodes) for r in roots):
+            raise ValueError('Invalid glTF scene root node')
         self.order: List[int] = []
         self.world: Dict[int, np.ndarray] = {}
         visited = set()
@@ -133,6 +138,20 @@ class Scene:
                 self.instances.append(inst)
         if not self.instances:
             raise ValueError('No triangle geometry found in input (points and lines are ignored)')
+        self._check_geometry()
+
+    def _check_geometry(self):
+        """Reject geometry the model cannot be run on: non-finite positions
+        (NaN/inf data or transforms, or float32 overflow) and a mesh of zero
+        extent, which normalization would divide by."""
+        vertices = self.vertices()
+        with np.errstate(over='ignore', invalid='ignore'):
+            single = vertices.astype(np.float32)
+            extent = np.ptp(single, axis=0)
+        if not np.isfinite(single).all() or not np.isfinite(extent).all():
+            raise ValueError('Input geometry has non-finite (NaN, infinite or out-of-range) vertex positions')
+        if not extent.max() > 0:
+            raise ValueError('Input geometry has zero extent (all vertices coincide)')
 
     def _check_mesh_limits(self, limits: InputLimits):
         """Bound decoded geometry from accessor metadata, before decoding any of it."""
@@ -148,9 +167,9 @@ class Scene:
             for prim in mesh_primitives:
                 if not _is_triangle_primitive(prim):
                     continue
-                count = int(accessors[prim['attributes']['POSITION']]['count'])
+                count = element_count(accessors[prim['attributes']['POSITION']]['count'])
                 vertices += count
-                elements = int(accessors[prim['indices']]['count']) if 'indices' in prim else count
+                elements = element_count(accessors[prim['indices']]['count']) if 'indices' in prim else count
                 faces += elements if prim.get('mode', 4) != 4 else elements // 3
             check_limit(vertices, limits.max_vertices, 'vertex count')
             check_limit(faces, limits.max_faces, 'triangle count')
@@ -440,9 +459,10 @@ def _export_skinned_glb(scene, filepath, joints, parents, joint_names, skin, *,
             src = prim.json
             attrs = {'POSITION': _write_attribute(builder, prim.positions + shift, bounds=True)}
             if 'NORMAL' in src['attributes']:
-                normals = document.accessor(src['attributes']['NORMAL'])
-                if len(normals) != n:
+                # Checked before decoding: the count is not bounded by the limits.
+                if element_count(document.data['accessors'][src['attributes']['NORMAL']]['count']) != n:
                     raise ValueError('Attribute NORMAL count does not match POSITION')
+                normals = document.accessor(src['attributes']['NORMAL'])
                 attrs['NORMAL'] = _write_attribute(builder, _unit(normals.astype(np.float64) @ normal_m.T))
             sl = slice(vertex_offset, vertex_offset + n)
             for s in range(ids_all.shape[1] // 4):
