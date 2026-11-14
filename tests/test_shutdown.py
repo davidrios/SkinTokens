@@ -8,6 +8,53 @@ import time
 
 import pytest
 
+from src.server.pool import WorkerPool
+from src.server import worker
+from pool_fixtures import close_pipe_before_finalizers
+
+
+def test_close_waits_for_cleanup_after_event_pipe_eof(tmp_path, caplog, monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(worker, "main", close_pipe_before_finalizers)
+    marker = tmp_path / "finalized"
+
+    async def scenario():
+        pool = WorkerPool("pool_fixtures:RESOURCES", 2, options={
+            "finalize_delay": 6, "finalize_marker": str(marker)})
+        await pool.start()
+        await pool.close(timeout=15)
+        assert all(w.process.exitcode == 0 for w in pool._workers)
+        assert all(not w.reader.is_alive() for w in pool._workers)
+        assert all(w.events.closed for w in pool._workers)
+        assert not pool._respawns
+
+    asyncio.run(scenario())
+    assert marker.read_text() == "complete"
+    assert "stopping it" not in caplog.text
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGTERM fallback is POSIX")
+def test_close_kills_cleanup_that_exceeds_deadline(tmp_path, monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(worker, "main", close_pipe_before_finalizers)
+    marker = tmp_path / "stuck"
+
+    async def scenario():
+        pool = WorkerPool("pool_fixtures:RESOURCES", 1, options={
+            "finalize_delay": 30, "finalize_marker": str(marker), "ignore_term": True})
+        await pool.start()
+        started = time.monotonic()
+        await pool.close(timeout=0.5)
+        assert time.monotonic() - started < 12
+        assert pool._workers[0].process.exitcode == -signal.SIGKILL
+        assert not pool._workers[0].reader.is_alive()
+        assert pool._workers[0].events.closed
+
+    asyncio.run(scenario())
+    assert marker.read_text() == "started"
+
 
 GATEWAY = '''
 import asyncio

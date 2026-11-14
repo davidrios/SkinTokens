@@ -6,7 +6,16 @@ processes, so keep it free of test-only imports.
 import os
 import time
 
-from src.server.worker import ServiceSpec
+from src.server.worker import ServiceSpec, main as worker_main
+
+
+def close_pipe_before_finalizers(*args):
+    """Simulate IPC closing before model/compiler process-exit hooks finish."""
+    try:
+        worker_main(*args)
+    finally:
+        args[1].close()
+        args[2].close()
 
 
 def _load(options):
@@ -42,13 +51,29 @@ ECHO = ServiceSpec("echo", _load, _run)
 
 def _load_resources(options):
     import multiprocessing
+    from multiprocessing.util import Finalize
 
     # Keep named semaphores alive until normal process teardown. A worker
     # killed by group-wide SIGTERM cannot run their unlink finalizers.
     global _resources
     ctx = multiprocessing.get_context("spawn")
     _resources = [ctx.Semaphore(1), ctx.Semaphore(1)]
+    if options.get("finalize_delay"):
+        Finalize(None, _finalize_resources,
+                 args=(options["finalize_delay"], options["finalize_marker"],
+                       options.get("ignore_term", False)), exitpriority=10)
     return _load(options)
+
+
+def _finalize_resources(delay, marker, ignore_term):
+    import signal
+    from pathlib import Path
+
+    if ignore_term:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    Path(marker).write_text("started")
+    time.sleep(delay)
+    Path(marker).write_text("complete")
 
 
 RESOURCES = ServiceSpec("resources", _load_resources, _run)

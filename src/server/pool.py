@@ -147,13 +147,17 @@ class _Worker:
             # the worker can no longer be heard, so it must not keep running.
             logger.exception("%s sent an unreadable message; stopping it", self.name)
             self.process.kill()
-        # The pipe closes just before the process is reaped; wait for its exit
-        # code, off the event loop.
-        self.process.join(timeout=5)
-        if self.process.is_alive():
-            logger.error("%s closed its pipe but did not exit; stopping it", self.name)
-            self.process.kill()
+        # This thread alone reaps the process. Concurrent Process.join()/poll()
+        # calls can race on waitpid and temporarily report an exited child as
+        # alive. EOF can also precede slow model/compiler finalizers: during
+        # shutdown close() owns the deadline and escalation, not this reader.
+        if not self.pool._closing:
             self.process.join(timeout=5)
+            if self.process.is_alive() and not self.pool._closing:
+                logger.error("%s closed its pipe but did not exit; stopping it", self.name)
+                self.process.kill()
+        self.process.join()
+        self.events.close()
         with suppress(RuntimeError):  # The loop is closed.
             loop.call_soon_threadsafe(self._on_exit)
 
@@ -310,16 +314,23 @@ class WorkerPool:
             worker.stop()
 
         def join() -> None:
-            deadline = time.monotonic() + timeout
-            for worker in workers:
-                worker.process.join(max(0.0, deadline - time.monotonic()))
-            for worker in workers:
-                if worker.process.is_alive():
-                    worker.process.terminate()
-                    worker.process.join(5)
-                if worker.process.is_alive():
-                    worker.process.kill()
-                    worker.process.join(5)
+            def wait(pending: list[_Worker], seconds: float) -> list[_Worker]:
+                deadline = time.monotonic() + seconds
+                for worker in pending:
+                    worker.reader.join(max(0.0, deadline - time.monotonic()))
+                return [worker for worker in pending if worker.reader.is_alive()]
+
+            pending = wait(workers, timeout)
+            for worker in pending:
+                logger.warning("%s exceeded shutdown timeout; terminating it", worker.name)
+                worker.process.terminate()
+            pending = wait(pending, 5)
+            for worker in pending:
+                logger.warning("%s did not terminate; killing it", worker.name)
+                worker.process.kill()
+            pending = wait(pending, 5)
+            if pending:
+                raise RuntimeError("worker processes did not exit after being killed")
 
         await asyncio.to_thread(join)
         for worker in workers:
