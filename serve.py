@@ -427,7 +427,7 @@ class _RequestRecord:
 
     def log_line(self, elapsed: float) -> tuple[int, str]:
         parts = [f"[{self.request_id}]", "generate", f"status={self.status}",
-                 f"elapsed={elapsed:.2f}s", f"client={self.client}"]
+                 f"elapsed={elapsed:.2f}s", f"client={self.client_addr}"]
         if self.filename is not None:
             parts.append(f"filename={self.filename!r}")
         if self.upload_bytes is not None:
@@ -490,7 +490,7 @@ async def ws_generate(ws: WebSocket):
     outbox = None
 
     await ws.accept()
-    logger.debug("[%s] WebSocket connected client=%s", request_id, ws.client)
+    logger.debug("[%s] WebSocket connected client=%s", request_id, record.client_addr)
 
     async def reject(message: str) -> None:
         record.reject(message)
