@@ -417,7 +417,7 @@ def test_ws_rejects_bad_frames_and_params():
 
 
 def test_ws_refuses_requests_beyond_the_queue_limit(monkeypatch):
-    monkeypatch.setattr(serve.config, "WORKERS", 1)
+    monkeypatch.setattr(serve.config, "WORKERS_PER_GPU", 1)
     monkeypatch.setattr(serve.config, "MAX_QUEUE", 2)
     serve.state.admitted = 3
     ws = _FakeWs('{"filename": "a.glb"}', b"upload")

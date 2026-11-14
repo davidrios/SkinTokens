@@ -162,10 +162,11 @@ docker compose up -d
 ```
 
 The server runs a pool of worker processes, each with its own copy of the
-model on the GPU and serving one request at a time, so `SKINTOKENS_WORKERS`
-requests (default 2) are parsed, sampled and exported in parallel;
-further requests queue in FIFO order and receive `queue_ahead` heartbeats.
-Each worker needs roughly 2-4 GB of VRAM. Measure concurrent throughput with:
+model on the GPU and serving one request at a time. `SKINTOKENS_WORKERS`
+(default 2) sets the number of workers **on each visible GPU** (pinned
+round-robin), so up to that many times the number of GPUs are parsed, sampled
+and exported in parallel; further requests queue in FIFO order and receive
+`queue_ahead` heartbeats. Each worker needs roughly 2-4 GB of VRAM. Measure concurrent throughput with:
 
 ```powershell
 python scripts/load_test.py --server http://127.0.0.1:8087 -c 4 --json after.json

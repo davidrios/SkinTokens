@@ -156,8 +156,24 @@ class _Inbox:
             self._tokens.pop(job_id, None)
 
 
-def main(spec_reference: str, jobs, events, options: dict) -> None:
-    """Process entry point. *jobs* is read, *events* written."""
+def _pin_worker_gpu(gpu) -> None:
+    """Restrict this worker to its assigned physical GPU, before CUDA loads.
+
+    *gpu* is the physical index the gateway pinned this worker to (``None``
+    when the pool is not spreading over GPUs). Pinning ``CUDA_VISIBLE_DEVICES``
+    to it makes that GPU the only one this process sees, so the pipeline's
+    ``cuda`` device lands on it. Called at the very start of the process,
+    before any CUDA context exists.
+    """
+    if gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+
+
+def main(spec_reference: str, jobs, events, options: dict, gpu=None) -> None:
+    """Process entry point. *jobs* is read, *events* written; *gpu* is the
+    physical index the pool pinned this worker to (``None`` for a
+    single-GPU pool)."""
+    _pin_worker_gpu(gpu)
     # Ctrl+C in a terminal reaches the whole process group; the gateway decides
     # when workers stop.
     signal.signal(signal.SIGINT, signal.SIG_IGN)

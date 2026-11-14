@@ -3,14 +3,17 @@
 A :class:`WorkerPool` runs a fixed number of worker processes
 (:mod:`src.server.worker`), each owning a copy of the model and running one
 request at a time, so up to ``size`` requests run in parallel: their parsing,
-GPU inference and export never wait on one another. Requests wait for a free
-worker in FIFO order; a waiting request gets a once-per-second queue heartbeat.
+GPU inference and export never wait on one another. The pool is sized as
+*per-GPU workers* times the number of visible GPUs: workers are pinned to the
+cards round-robin (each sees its one GPU as ``cuda:0``). Requests wait for a
+free worker in FIFO order; a waiting request gets a once-per-second queue
+heartbeat.
 
 A request can be cancelled while it waits (it leaves the queue) or while it
 runs (the worker is told to stop it and is free again once it has).
 
 A worker that exits (a crash, a fatal CUDA error, the OOM killer) fails only
-the request it was running; the pool starts a replacement.
+the request it was running; the pool starts a replacement on the same GPU.
 
 Adapted from the AnyCross server's worker pool.
 """
@@ -108,7 +111,8 @@ class _Worker:
         _enlarge_pipe(self.events)
         self.process = ctx.Process(
             target=worker_module.main,
-            args=(pool.spec, jobs_read, events_write, pool.options),
+            args=(pool.spec, jobs_read, events_write, pool.options,
+                  pool._gpu_for_slot(slot)),
             name=f"skintokens-worker-{slot}",
         )
         self.process.start()
@@ -228,18 +232,27 @@ async def _first(future: asyncio.Future, event: Optional[asyncio.Event]) -> None
 
 
 class WorkerPool:
-    """A fixed number of worker processes running *spec*.
+    """Worker processes running *spec*, spread across the visible GPUs.
+
+    *per_gpu* is the number of workers to run **on each** visible GPU; the pool
+    starts ``per_gpu * visible_gpus`` workers and pins them to the GPUs
+    round-robin (each worker sees its one card as ``cuda:0``).
 
     *spec* names the worker's :class:`src.server.worker.ServiceSpec` as
     ``"module:NAME"``; *options* reach every worker's ``load``.
     """
 
-    def __init__(self, spec: str, size: int, *, options: Optional[dict] = None,
-                 restart_delay: float = 5.0) -> None:
-        if size < 1:
-            raise ValueError(f"the pool needs at least one worker, got {size}")
+    def __init__(self, spec: str, per_gpu: int, *, visible_gpus: int = 1,
+                 options: Optional[dict] = None, restart_delay: float = 5.0) -> None:
+        per_gpu = int(per_gpu)
+        visible_gpus = max(1, int(visible_gpus))
+        if per_gpu < 1:
+            raise ValueError(f"the pool needs at least one worker per GPU, got {per_gpu}")
         self.spec = spec
-        self.size = size
+        self.per_gpu = per_gpu
+        self.gpus = visible_gpus
+        # One worker per (GPU, per-GPU slot): per_gpu workers on each card.
+        self.size = per_gpu * visible_gpus
         self.options = dict(options or {})
         self.restart_delay = restart_delay
         self.info: dict = {}
@@ -251,6 +264,17 @@ class WorkerPool:
         self._ids = itertools.count(1)
         self._closing = False
         self._respawns: set[asyncio.Task] = set()
+
+    def _gpu_for_slot(self, slot: int) -> Optional[int]:
+        """The physical GPU *slot* runs on, or ``None`` for a single-GPU pool.
+
+        Slots fill the cards round-robin (slot ``g`` of each GPU), so a pool of
+        *per_gpu* workers over *gpus* cards gives card *k* the slots
+        ``k, k + gpus, k + 2 gpus, ...``.
+        """
+        if self.gpus <= 1:
+            return None
+        return slot % self.gpus
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -267,8 +291,10 @@ class WorkerPool:
         self.info = self._workers[0].info
         for worker in self._workers:
             self._release(worker)
-        logger.info("worker pool ready: %d worker%s in %.1fs", self.size,
-                    "" if self.size == 1 else "s", time.monotonic() - started)
+        logger.info("worker pool ready: %d worker%s across %d GPU%s (%d per GPU) in %.1fs",
+                    self.size, "" if self.size == 1 else "s",
+                    self.gpus, "" if self.gpus == 1 else "s",
+                    self.per_gpu, time.monotonic() - started)
 
     async def close(self, timeout: float = 30.0) -> None:
         """Stop the workers; running jobs finish first, up to *timeout* seconds."""
@@ -485,6 +511,8 @@ class WorkerPool:
                  if w.alive and w.ready.done() and not w.ready.exception()]
         return {
             "workers": self.size,
+            "per_gpu": self.per_gpu,
+            "gpus": self.gpus,
             "ready": len(ready),
             "busy": sum(1 for w in ready if w.job is not None),
             "idle": len(self._idle),

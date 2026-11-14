@@ -4,7 +4,9 @@ SkinTokens / TokenRig inference server — FastAPI persistent service.
 This process is the gateway: it holds the WebSocket connections and loads no
 model. Generation runs in a pool of worker processes (``src/server/pool.py``),
 each with its own copy of the model resident in VRAM and running one request at
-a time, so up to ``SKINTOKENS_WORKERS`` requests are parsed, sampled on the GPU
+a time. The pool runs ``SKINTOKENS_WORKERS`` workers **on each** visible GPU
+(pinned round-robin, each worker sees its card as ``cuda:0``), so up to
+``SKINTOKENS_WORKERS * (visible GPUs)`` requests are parsed, sampled on the GPU
 and exported fully in parallel. Further requests wait for a free worker in
 FIFO order and get a once-per-second queue heartbeat meanwhile.
 
@@ -18,7 +20,9 @@ Run:
     python serve.py --host 0.0.0.0 --port 8087
 
 Environment variables:
-    SKINTOKENS_WORKERS        Worker processes / parallel requests (default 2)
+    SKINTOKENS_WORKERS        Worker processes per GPU / parallel requests per
+                              GPU (default 2); total workers = this times the
+                              number of visible GPUs
     SKINTOKENS_MODEL_CKPT     Path to the model checkpoint
     SKINTOKENS_HF_PATH        Optional HuggingFace model path
     SKINTOKENS_DEVICE         Device override (default: cuda if available)
@@ -152,8 +156,24 @@ def _unsupported_output_message(output: str) -> str:
     return message
 
 
+def visible_gpu_count() -> int:
+    """The number of GPUs the pool spreads across.
+
+    ``torch.cuda.device_count()`` honours ``CUDA_VISIBLE_DEVICES`` and never
+    creates a CUDA context, so the gateway (which loads no model) can call it.
+    Returns 1 when no CUDA is visible, so a single-GPU / CPU host still starts
+    one worker per GPU.
+    """
+    try:
+        import torch
+        count = torch.cuda.device_count()
+    except Exception:
+        count = 0
+    return max(1, int(count))
+
+
 def _admission_limit() -> int:
-    return config.WORKERS + config.MAX_QUEUE
+    return config.WORKERS_PER_GPU * visible_gpu_count() + config.MAX_QUEUE
 
 
 def _client_error_message(exc: BaseException, request_id: str) -> str:
@@ -295,20 +315,25 @@ class _WsOutbox:
 # --------------------------------------------------------------------------- #
 def _worker_options() -> dict:
     return {"model_ckpt": config.MODEL_CKPT, "hf_path": config.HF_PATH,
-            "cpu_threads": config.worker_cpu_threads(config.WORKERS)}
+            "cpu_threads": config.worker_cpu_threads(
+                config.WORKERS_PER_GPU * visible_gpu_count())}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting %d worker process%s", config.WORKERS,
-                "" if config.WORKERS == 1 else "es")
-    pool = WorkerPool(WORKER_SPEC, config.WORKERS, options=_worker_options())
+    gpus = visible_gpu_count()
+    total = config.WORKERS_PER_GPU * gpus
+    logger.info("Starting %d worker process%s (%d per GPU across %d GPU%s)",
+                total, "" if total == 1 else "es",
+                config.WORKERS_PER_GPU, gpus, "" if gpus == 1 else "s")
+    pool = WorkerPool(WORKER_SPEC, config.WORKERS_PER_GPU, visible_gpus=gpus,
+                      options=_worker_options())
     await pool.start()
     state.pool = pool
     state.ready = True
     state.loaded_at = time.time()
-    logger.info("Pipeline ready: %d worker%s (%s)", config.WORKERS,
-                "" if config.WORKERS == 1 else "s", pool.info)
+    logger.info("Pipeline ready: %d worker%s (%s)", total,
+                "" if total == 1 else "s", pool.info)
     try:
         yield
     finally:
@@ -668,15 +693,16 @@ def main():
                         default=int(os.environ.get("SKINTOKENS_PORT", "8087")))
     parser.add_argument("--model-ckpt", default=config.MODEL_CKPT)
     parser.add_argument("--hf-path", default=config.HF_PATH)
-    parser.add_argument("--workers", type=int, default=config.WORKERS,
-                        help="worker processes (parallel requests); SKINTOKENS_WORKERS")
+    parser.add_argument("--workers", type=int, default=config.WORKERS_PER_GPU,
+                        help="worker processes per GPU (parallel requests per "
+                             "GPU); SKINTOKENS_WORKERS")
     args = parser.parse_args()
 
     if args.workers < 1:
         parser.error("--workers must be at least 1")
     config.MODEL_CKPT = args.model_ckpt
     config.HF_PATH = args.hf_path
-    config.WORKERS = args.workers
+    config.WORKERS_PER_GPU = args.workers
 
     import uvicorn
 

@@ -8,15 +8,20 @@ services:
     image: skintokens:cu128-torch2.11.0
     container_name: skintokens
     restart: unless-stopped
-    runtime: nvidia
+    # All host GPUs: the worker pool pins its workers to the cards
+    # round-robin (SKINTOKENS_WORKERS per GPU).
+    gpus: all
     environment:
       TZ: Asia/Shanghai
       NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
       SKINTOKENS_DEVICE: cuda
       SKINTOKENS_HOST: 0.0.0.0
       SKINTOKENS_PORT: 8000
-      # Worker processes, each with its own model copy (~2-4 GB VRAM): up to this
-      # many requests run in parallel on the GPU.
+      # Worker processes per GPU, each with its own model copy (~2-4 GB VRAM);
+      # the total is this count times the number of visible GPUs (workers are
+      # pinned to the cards round-robin), and up to that many requests run in
+      # parallel.
       SKINTOKENS_WORKERS: ${SKINTOKENS_WORKERS:-2}
       SKINTOKENS_MAX_NUM_SAMPLES: ${SKINTOKENS_MAX_NUM_SAMPLES:-1}
       SKINTOKENS_MAX_NEW_TOKENS: 2048
@@ -25,7 +30,8 @@ services:
       SKINTOKENS_ENABLE_GLB_OUTPUT: ${SKINTOKENS_ENABLE_GLB_OUTPUT:-0}
       # Requests allowed to wait for a worker beyond the ones running; each
       # holds its upload in the gateway, so this bounds gateway memory to
-      # about (SKINTOKENS_WORKERS + SKINTOKENS_MAX_QUEUE) * SKINTOKENS_MAX_UPLOAD_MB.
+      # about (total workers + SKINTOKENS_MAX_QUEUE) * SKINTOKENS_MAX_UPLOAD_MB
+      # (total workers = SKINTOKENS_WORKERS times the number of visible GPUs).
       SKINTOKENS_MAX_QUEUE: ${SKINTOKENS_MAX_QUEUE:-16}
       # Time a client has to send its header / its whole upload, in seconds.
       SKINTOKENS_HEADER_TIMEOUT_SEC: ${SKINTOKENS_HEADER_TIMEOUT_SEC:-30}
@@ -62,13 +68,6 @@ services:
       start_period: 120s
     networks:
       - ai-shared
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
 
 volumes:
   skintokens-outputs:

@@ -50,9 +50,11 @@ HF_PATH = os.environ.get("SKINTOKENS_HF_PATH") or None
 STARTUP_HEARTBEAT_SEC = max(1.0, float(os.environ.get("SKINTOKENS_STARTUP_HEARTBEAT_SEC", "15")))
 SUPPORTED_EXT = {".glb", ".gltf"}
 
-# Worker processes, each with its own copy of the model on the GPU; up to this
-# many requests run fully in parallel (parse, inference and export).
-WORKERS = env_int("SKINTOKENS_WORKERS", 2, 1, 32)
+# Worker processes per visible GPU, each with its own copy of the model; the
+# pool starts this many on every GPU (pinned round-robin), so up to
+# WORKERS_PER_GPU * (visible GPUs) requests run fully in parallel
+# (parse, inference and export).
+WORKERS_PER_GPU = env_int("SKINTOKENS_WORKERS", 2, 1, 32)
 # CPU threads per worker for torch/OpenMP (0 = an equal share of the cores).
 WORKER_CPU_THREADS = env_int("SKINTOKENS_WORKER_CPU_THREADS", 0, 0, 256)
 
@@ -77,7 +79,8 @@ HEADER_TIMEOUT_SEC = env_int("SKINTOKENS_HEADER_TIMEOUT_SEC", 30, 1, 3600)
 UPLOAD_TIMEOUT_SEC = env_int("SKINTOKENS_UPLOAD_TIMEOUT_SEC", 300, 1, 3600)
 # Requests allowed to wait for a worker beyond the ones running. Each holds its
 # upload (up to MAX_UPLOAD_MB) in the gateway, so this bounds gateway memory
-# to about (WORKERS + MAX_QUEUE) * MAX_UPLOAD_MB; further requests are refused.
+# to about (total workers + MAX_QUEUE) * MAX_UPLOAD_MB; further requests are
+# refused.
 MAX_QUEUE = env_int("SKINTOKENS_MAX_QUEUE", 16, 0, 10000)
 USE_GENERATION_CACHE = env_flag("SKINTOKENS_USE_CACHE", True)
 EMPTY_CACHE_AFTER_INFERENCE = env_flag("SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE", True)
