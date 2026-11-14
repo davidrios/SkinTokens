@@ -1,5 +1,6 @@
 """The GPU grammar processor matches the host one token for token."""
 import random
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,6 +34,52 @@ def test_gpu_grammar_is_selected(monkeypatch):
     processor = get_logits_processor(tok, tok.vocab_size + SKIN_CODES, TOKENS_PER_SKIN,
                                      torch.tensor([tok.bos, tok.token_id_cls_none]))[0]
     assert isinstance(processor, GpuGrammarLogitsProcessor)
+
+
+def test_generate_continues_past_skeleton_eos(monkeypatch):
+    """Exercise HF generation through the skeleton marker and into skin codes."""
+    from transformers import GPT2Config, GPT2LMHeadModel, LogitsProcessorList
+    from src.model import tokenrig
+
+    tok = make_tokenizer()
+    final_eos = tok.vocab_size + SKIN_CODES
+    sequence = [tok.eos, tok.vocab_size, tok.vocab_size + 1, final_eos]
+
+    class FakeVAE:
+        def _encode(self, **kwargs):
+            return None, torch.zeros(1, 1, 8)
+
+    class ForceSequence:
+        def __init__(self):
+            self.step = 0
+
+        def __call__(self, input_ids, scores):
+            scores.fill_(-float('inf'))
+            scores[:, sequence[self.step]] = 0
+            self.step += 1
+            return scores
+
+    transformer = GPT2LMHeadModel(GPT2Config(
+        vocab_size=final_eos + 1, n_embd=8, n_layer=1, n_head=1,
+        n_positions=32, bos_token_id=tok.bos, eos_token_id=final_eos,
+        pad_token_id=tok.pad,
+    )).eval()
+    monkeypatch.setattr(tokenrig, 'SkinFSQCVAEModel', FakeVAE)
+    monkeypatch.setattr(tokenrig, 'encode_mesh_cond', lambda *args: torch.zeros(1, 1, 8))
+    monkeypatch.setattr(tokenrig, 'get_logits_processor',
+                        lambda **kwargs: LogitsProcessorList([ForceSequence()]))
+    prompt = [tok.bos, tok.token_id_cls_none]
+    model = SimpleNamespace(
+        vae=SimpleNamespace(model=FakeVAE()), tokenizer=tok, eos=final_eos,
+        tokens_per_skin=TOKENS_PER_SKIN, tokens_skin_cond=1,
+        mesh_encoder=None, output_proj=None, transformer=transformer,
+        make_start_tokens=lambda **kwargs: [prompt],
+    )
+    results = tokenrig.TokenRig.generate(
+        model, vertices=torch.zeros(3, 3), normals=torch.zeros(3, 3),
+        only_ids=True, max_new_tokens=len(sequence),
+    )
+    assert results[0].output_ids.tolist() == prompt + sequence
 
 
 def walk(seed, prompt, batch, device="cpu", max_steps=160):

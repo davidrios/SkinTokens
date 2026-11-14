@@ -474,7 +474,8 @@ class TokenRig(ModelSpec):
         results = self.transformer.generate(
             inputs_embeds=inputs_embeds,
             bos_token_id=self.tokenizer.bos,
-            eos_token_id=self.tokenizer.eos,
+            # tokenizer.eos ends the skeleton; skin codes follow until self.eos.
+            eos_token_id=self.eos,
             pad_token_id=self.tokenizer.pad,
             logits_processor=logits_processor,
             # Greedy: the grammar masks the logits, then the argmax is taken.
