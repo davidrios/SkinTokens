@@ -112,7 +112,7 @@ def run_rows(decoder, arrivals, steps_limit=2000, remove_at=None):
     return finished, inserted
 
 
-@pytest.mark.parametrize("slots", [1, 2, 4])
+@pytest.mark.parametrize("slots", [1, 2, 3, 4])
 def test_rows_joining_and_leaving_decode_like_a_plain_forward(model, slots):
     max_new = 48
     decoder = BatchDecoder(model, slots, max_new, prompt_length=PROMPT + 2)
@@ -138,6 +138,29 @@ def test_the_compiled_step_decodes_like_a_plain_forward(model):
                 7: [(3, *make_prompt(model, 40))]}
     finished, inserted = run_rows(decoder, arrivals)
     assert set(finished) == {0, 1, 2, 3}
+    for key, ids in finished.items():
+        check_row(model, *inserted[key], ids, max_new)
+
+
+@pytest.mark.parametrize("slots", [3, 4])
+@pytest.mark.parametrize("compile_step", [False, True])
+def test_three_rows_replay_batch_three(model, slots, compile_step):
+    if compile_step and not decode_attention._has_triton():
+        pytest.skip("inductor needs Triton")
+    max_new = 32
+    decoder = BatchDecoder(model, slots, max_new, prompt_length=PROMPT + 2,
+                           compile_step=compile_step)
+    decoder.capture()
+    replayed = []
+    for bucket, graph in list(decoder._graphs.items()):
+        def replay(bucket=bucket, graph=graph):
+            replayed.append(bucket)
+            graph.replay()
+        decoder._graphs[bucket] = SimpleNamespace(replay=replay)
+    arrivals = {0: [(i, *make_prompt(model, 50 + i)) for i in range(3)]}
+    finished, inserted = run_rows(decoder, arrivals)
+    assert replayed[0] == 3 and 4 not in replayed
+    assert set(finished) == {0, 1, 2}
     for key, ids in finished.items():
         check_row(model, *inserted[key], ids, max_new)
 
@@ -169,6 +192,7 @@ def test_insert_needs_a_free_slot_and_a_prompt_that_fits(model):
     assert decoder.remove("a") and decoder.free == 1
 
 
-def test_slots_must_be_a_supported_batch_size(model):
+@pytest.mark.parametrize("slots", [0, 5])
+def test_slots_must_be_a_supported_batch_size(model, slots):
     with pytest.raises(ValueError):
-        BatchDecoder(model, 3, 8, prompt_length=PROMPT + 2)
+        BatchDecoder(model, slots, 8, prompt_length=PROMPT + 2)

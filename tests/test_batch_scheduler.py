@@ -22,6 +22,12 @@ from src.server.stages import InferInput, pack, unpack
 from src.server.worker import Cancellation, GenerationCancelled, Stopped
 
 
+@pytest.mark.parametrize("slots", [0, 1, 2, 3, 4])
+def test_batch_slots_environment_preserves_supported_values(monkeypatch, slots):
+    monkeypatch.setenv("SKINTOKENS_BATCH_SLOTS", str(slots))
+    assert pipeline.config._batch_slots() == slots
+
+
 class FakeDecoder:
     """Rows end after as many steps as their prompt has positions."""
 

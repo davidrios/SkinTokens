@@ -67,18 +67,14 @@ MAX_NUM_SAMPLES = env_int("SKINTOKENS_MAX_NUM_SAMPLES", 1, 1, 8)
 
 
 def _batch_slots() -> int:
-    """SKINTOKENS_BATCH_SLOTS: rows each GPU worker decodes at once (1, 2 or
-    4), or 0 for no batching."""
-    value = env_int("SKINTOKENS_BATCH_SLOTS", 4, 0, 4)
-    if value == 3:
-        logger.warning("SKINTOKENS_BATCH_SLOTS=3 is not a supported batch size; using 2")
-        value = 2
-    return value
+    """SKINTOKENS_BATCH_SLOTS: rows each GPU worker decodes at once (1–4),
+    or 0 for no batching."""
+    return env_int("SKINTOKENS_BATCH_SLOTS", 4, 0, 4)
 
 
 # Continuous batching (src/model/batch_decode.py): each GPU worker decodes up
 # to this many point clouds at once, requests joining and leaving between
-# decode steps, and accepts as many requests at a time. 1, 2 or 4; larger
+# decode steps, and accepts as many requests at a time. 1, 2, 3 or 4; larger
 # batches gain nothing more (decoding becomes compute bound). Needs fast
 # decode on CUDA; otherwise, or with 0, a worker runs one request at a time
 # (transformers' generate, as before continuous batching).

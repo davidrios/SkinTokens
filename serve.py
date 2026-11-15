@@ -11,7 +11,7 @@ overlap:
 3. ``export`` on a CPU worker: build the rig payload or GLB.
 
 Each GPU worker has its own copy of the model resident in VRAM and runs up
-to ``SKINTOKENS_BATCH_SLOTS`` (1, 2 or 4) requests' inference at once, decoding
+to ``SKINTOKENS_BATCH_SLOTS`` (1, 2, 3 or 4) requests' inference at once, decoding
 their point clouds together with continuous batching (``src/server/pipeline.py``);
 the GPU pool runs ``SKINTOKENS_WORKERS`` workers **on each** visible GPU
 (pinned round-robin, each worker sees its card as ``cuda:0``). The CPU workers (``SKINTOKENS_CPU_WORKERS``) load no model and
@@ -34,7 +34,7 @@ Environment variables:
     SKINTOKENS_WORKERS        GPU worker processes per GPU (default 1); total
                               GPU workers = this times the number of visible GPUs
     SKINTOKENS_BATCH_SLOTS    Requests (point clouds) each GPU worker decodes at
-                              once: 1, 2 or 4 (default 4), 0 for no batching;
+                              once: 1, 2, 3 or 4 (default 4), 0 for no batching;
                               needs fast decode on CUDA
     SKINTOKENS_CPU_WORKERS    CPU worker processes for parsing and export
                               (default 0 = twice the GPU workers)
@@ -772,7 +772,7 @@ def main():
     parser.add_argument("--workers", type=int, default=config.WORKERS_PER_GPU,
                         help="GPU worker processes per GPU; SKINTOKENS_WORKERS")
     parser.add_argument("--batch-slots", type=int, default=config.BATCH_SLOTS,
-                        choices=(0, 1, 2, 4),
+                        choices=(0, 1, 2, 3, 4),
                         help="requests each GPU worker decodes at once (0: no "
                              "batching); SKINTOKENS_BATCH_SLOTS")
     parser.add_argument("--cpu-workers", type=int, default=config.CPU_WORKERS,

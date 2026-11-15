@@ -26,8 +26,8 @@ services:
       # (workers are pinned to the cards round-robin), and up to that many
       # requests are on the GPUs at once.
       SKINTOKENS_WORKERS: ${SKINTOKENS_WORKERS:-1}
-      # Requests each GPU worker decodes at once (continuous batching): 1, 2
-      # or 4; 0 turns batching off.
+      # Requests each GPU worker decodes at once (continuous batching): 1, 2,
+      # 3 or 4; 0 turns batching off.
       SKINTOKENS_BATCH_SLOTS: ${SKINTOKENS_BATCH_SLOTS:-4}
       # CPU worker processes (no model, no GPU) that parse uploads and export
       # results beside the GPU work; 0 = twice the GPU workers.

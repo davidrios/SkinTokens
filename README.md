@@ -179,12 +179,14 @@ python load_test.py compare before.json after.json
 
 A GPU worker batches its requests continuously
 (`src/model/batch_decode.py`). It takes up to `SKINTOKENS_BATCH_SLOTS`
-(default 4; 1, 2 or 4) requests at once and decodes their point clouds
+(default 4; 1, 2, 3 or 4) requests at once and decodes their point clouds
 together, one per slot. A request joins as soon as a slot frees and leaves
 when its rig ends, without waiting for the others. A decode step over four
 rows costs little more than a step over one, so a single worker serves
 several requests in about the time of one; larger batches gain nothing more.
-Each batch size's decode step is captured once as a CUDA graph.
+Each batch size's decode step is captured once as a CUDA graph. The decode
+batch matches the number of active rows: three rows use batch 3, even with
+four slots configured.
 `SKINTOKENS_BATCH_SLOTS=0`, or fast decode off, or a CPU device, serves one
 request at a time through `transformers`' `generate`, as before.
 

@@ -10,7 +10,7 @@ workers, so the stage needs no locks.
 
 With fast decode on CUDA, a worker batches its requests continuously
 (:func:`serve`, :mod:`src.model.batch_decode`): it accepts up to
-``SKINTOKENS_BATCH_SLOTS`` (1, 2 or 4) requests at once and decodes up to that
+``SKINTOKENS_BATCH_SLOTS`` (1, 2, 3 or 4) requests at once and decodes up to that
 many point clouds together, each joining when a slot frees and leaving when
 it ends. Otherwise it serves one request at a time (:func:`run_job`).
 

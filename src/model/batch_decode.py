@@ -21,7 +21,7 @@ How a step works:
   notices, so a step needs no host round-trip. The host reads the rows' status
   through an asynchronous copy and frees ended rows a few steps later.
 * Occupied slots are kept compact (``0..n-1``), so a step runs on the smallest
-  *bucket* (1, 2 or 4 rows) that holds them. Each bucket's step is captured
+  *bucket* (1, 2, 3 or 4 rows) that holds them. Each bucket's step is captured
   once as a CUDA graph and replayed.
 
 Batching changes which kernels run for a row (their shapes depend on the
@@ -42,7 +42,7 @@ from . import grammar as grammar_module
 
 logger = logging.getLogger(__name__)
 
-BUCKETS = (1, 2, 4)
+BUCKETS = (1, 2, 3, 4)
 # Decode steps the host may queue beyond the last status it has read: bounds
 # how late an ended row (or a cancellation) is noticed.
 MAX_STEPS_AHEAD = 8
