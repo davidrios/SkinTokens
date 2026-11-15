@@ -32,7 +32,7 @@ services:
       # CPU worker processes (no model, no GPU) that parse uploads and export
       # results beside the GPU work; 0 = twice the GPU workers.
       SKINTOKENS_CPU_WORKERS: ${SKINTOKENS_CPU_WORKERS:-0}
-      SKINTOKENS_MAX_NUM_SAMPLES: ${SKINTOKENS_MAX_NUM_SAMPLES:-1}
+      SKINTOKENS_MAX_NUM_SAMPLES: ${SKINTOKENS_MAX_NUM_SAMPLES:-4}
       SKINTOKENS_MAX_NEW_TOKENS: 2048
       # Results are rig payloads (skeleton + skin; clients add them to the file
       # they uploaded). Set to 1 to also serve "output": "glb" (whole GLBs).
