@@ -14,6 +14,7 @@ with SKINTOKENS_ENABLE_GLB_OUTPUT=1) and needs only ``websockets``.
 """
 import argparse
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -75,6 +76,94 @@ def _write(path: str, data: bytes) -> None:
         f.write(data)
 
 
+def _minimal_glb_for_rig(file_data: bytes) -> bytes:
+    """Keep only mesh positions, triangle indices and scene structure.
+
+    The server regenerates normals from the mesh and does not use materials,
+    textures, UVs, vertex colors, animation, or existing skin weights. Preserve
+    node/mesh/primitive indices and the hierarchy because rig payloads use that
+    layout to verify that the client is applying them to the same mesh.
+    This is an internal upload representation for our scene reader, not a
+    standalone renderable asset: skin attributes and ignored primitive data
+    are omitted, while skin markers and primitive slots remain for alignment.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from src.rig_package.glb_io import Builder, Document
+    except ImportError as exc:
+        raise RuntimeError(f"minimizing the upload needs this repository's src package ({exc})") from exc
+
+    document = Document(file_data, name="input.glb")
+    source = document.data
+    extension = "EXT_mesh_gpu_instancing"
+    if (extension in source.get("extensionsUsed", [])
+            or extension in source.get("extensionsRequired", [])
+            or any(extension in node.get("extensions", {}) for node in source.get("nodes", []))):
+        raise ValueError(f"{extension} is not supported; expand mesh instances before importing")
+    builder = Builder()
+    data = builder.data
+    data["asset"] = copy.deepcopy(source["asset"])
+
+    # Keep transforms, mesh references, names, and the skin marker used by the
+    # scene reader to identify bind-pose meshes. Drop unrelated node data.
+    node_keys = ("name", "mesh", "skin", "children", "matrix", "translation", "rotation", "scale")
+    data["nodes"] = []
+    for node in source.get("nodes", []):
+        slim_node = {key: copy.deepcopy(node[key]) for key in node_keys if key in node}
+        data["nodes"].append(slim_node)
+    if "skins" in source:
+        data["skins"] = [
+            {key: copy.deepcopy(skin[key]) for key in ("name", "joints", "skeleton") if key in skin}
+            for skin in source["skins"]
+        ]
+    # An absent/empty scenes list makes the reader traverse all root nodes.
+    # Do not replace that fallback with a scene containing no roots.
+    data["scenes"] = copy.deepcopy(source.get("scenes", []))
+    data["scene"] = source.get("scene", 0)
+
+    meshes = []
+    for mesh in source.get("meshes", []):
+        primitives = []
+        for primitive in mesh.get("primitives", []):
+            mode = primitive.get("mode", 4)
+            if mode not in (4, 5, 6):
+                # Lines and points are ignored by the server. Keep their slot
+                # so triangle primitive indices in the rig payload stay exact.
+                primitives.append({"mode": mode})
+                continue
+
+            if "KHR_draco_mesh_compression" in primitive.get("extensions", {}):
+                raise ValueError("KHR_draco_mesh_compression meshes are not supported; "
+                                 "export the GLB without Draco compression")
+            attributes = primitive.get("attributes", {})
+            if "POSITION" not in attributes:
+                raise ValueError("glTF primitive without POSITION is not supported")
+            positions = document.accessor(attributes["POSITION"]).astype("float32")
+            position_accessor = builder.accessor(positions, "VEC3", bounds=True)
+            slim_primitive = {"attributes": {"POSITION": position_accessor}}
+            if "indices" in primitive:
+                indices = document.accessor(primitive["indices"]).astype("uint32")
+                slim_primitive["indices"] = builder.accessor(
+                    indices, "SCALAR", component=5125, target=34963
+                )
+            if "extensions" in primitive:
+                # Preserve unsupported geometry markers so the server reports
+                # the same actionable error instead of silently changing it.
+                slim_primitive["extensions"] = copy.deepcopy(primitive["extensions"])
+            if "mode" in primitive:
+                slim_primitive["mode"] = mode
+            primitives.append(slim_primitive)
+        slim_mesh = {key: copy.deepcopy(mesh[key]) for key in ("name",) if key in mesh}
+        slim_mesh["primitives"] = primitives
+        meshes.append(slim_mesh)
+    data["meshes"] = meshes
+
+    for key in ("extensionsUsed", "extensionsRequired"):
+        if key in source:
+            data[key] = copy.deepcopy(source[key])
+    return builder.to_bytes()
+
+
 def _rebuilder(file_data: bytes, filename: str):
     """A function turning a rig payload into ``file_data`` rigged: the input
     file with the skeleton and skin added, its materials, textures and node
@@ -110,6 +199,11 @@ async def _run(args) -> None:
         file_data = f.read()
 
     filename = os.path.basename(args.input)
+    upload_data = file_data
+    if Path(filename).suffix.lower() == ".glb" and args.output_format == "rig":
+        upload_data = _minimal_glb_for_rig(file_data)
+        print(f"[client] minimized GLB upload: {len(file_data)} -> {len(upload_data)} bytes "
+              f"({100 * len(upload_data) / max(1, len(file_data)):.1f}%)")
 
     payload = {
         "filename": filename,
@@ -134,7 +228,7 @@ async def _run(args) -> None:
             compression=None,
         ) as ws:
             await ws.send(json.dumps(payload))
-            await ws.send(file_data)
+            await ws.send(upload_data)
 
             glb_count = 0
             expected_samples = args.num_samples
