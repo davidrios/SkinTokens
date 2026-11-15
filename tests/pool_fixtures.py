@@ -87,3 +87,42 @@ def _idle():
 
 
 IDLE = ServiceSpec("idle", _load, _run, _idle)
+
+
+# The staged pipeline (serve._generate) with stand-in stages: each sleeps for
+# the seconds given in the stage durations below and hands on the spans
+# (stage, request, start, end, CUDA_VISIBLE_DEVICES) every stage so far ran in.
+STAGE_SECONDS = {"prepare": 0.4, "infer": 0.6, "export": 0.4}
+
+
+def _stage_span(stage, params, cancellation):
+    started = time.time()
+    deadline = time.monotonic() + STAGE_SECONDS[stage]
+    while time.monotonic() < deadline:
+        cancellation.raise_if_cancelled()
+        time.sleep(0.01)
+    return [stage, params["request_id"], started, time.time(),
+            os.environ.get("CUDA_VISIBLE_DEVICES")]
+
+
+def _run_cpu_stage(params, payload, cancellation, progress):
+    import json
+    stage = params["stage"]
+    if stage == "prepare":
+        assert params["seed"] is not None and params["suffix"] == ".glb"
+        span = _stage_span("prepare", params, cancellation)
+        progress({"progress": 5, "step": "building dataset", "elapsed_sec": 0.0})
+        return {"infer": json.dumps([span]).encode(), "export": payload}
+    context, spans = payload
+    spans = json.loads(spans) + [_stage_span("export", params, cancellation)]
+    return [context + b"|" + json.dumps(spans).encode()]
+
+
+def _run_gpu_stage(params, payload, cancellation, progress):
+    import json
+    assert "stage" not in params and params["seed"] is not None
+    return json.dumps(json.loads(payload) + [_stage_span("infer", params, cancellation)]).encode()
+
+
+STAGED_CPU = ServiceSpec("staged-cpu", _load, _run_cpu_stage)
+STAGED_GPU = ServiceSpec("staged-gpu", _load, _run_gpu_stage)

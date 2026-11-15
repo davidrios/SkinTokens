@@ -175,9 +175,9 @@ def test_limits_from_env(monkeypatch):
 
 
 def test_serve_never_uses_client_filename_as_path(monkeypatch):
-    """The gateway passes only the upload's suffix to the worker, which keeps
-    the upload in memory under a fixed name (nothing is written to disk)."""
-    from src.server import pipeline
+    """The gateway passes only the upload's suffix to the CPU worker, which
+    keeps the upload in memory under a fixed name (nothing is written to disk)."""
+    from src.server import stages
     from src.server.worker import Cancellation
 
     seen = []
@@ -186,13 +186,14 @@ def test_serve_never_uses_client_filename_as_path(monkeypatch):
         seen.append(source)
         raise RuntimeError("stop")
 
-    monkeypatch.setitem(pipeline.STAGES, "prepare", fake_prepare)
+    monkeypatch.setitem(stages.STAGES, "prepare", fake_prepare)
     for name in ("../../escape.glb", "C:/Windows/escape.glb", "/etc/escape.glb", "a/../../b.glb"):
         suffix = serve._validate_upload(b"data", name)
         with pytest.raises(RuntimeError, match="stop"):
-            pipeline.run_job({"suffix": suffix, "request_id": "req"}, b"data", Cancellation())
+            stages.run_job({"stage": "prepare", "suffix": suffix, "request_id": "req", "seed": 1},
+                           b"data", Cancellation())
     assert len(seen) == 4
-    assert all(isinstance(s, pipeline.Upload) and s.name == "input.glb" and s.data == b"data"
+    assert all(isinstance(s, stages.Upload) and s.name == "input.glb" and s.data == b"data"
                for s in seen)
 
 
@@ -392,6 +393,7 @@ class _FakeWs:
 
 def _run_ws(ws):
     serve.state.pool = object()  # not used on the paths under test
+    serve.state.cpu_pool = object()
     asyncio.run(serve.ws_generate(ws))
     return ws.sent[-1]["message"] if ws.sent else None
 
@@ -418,9 +420,12 @@ def test_ws_rejects_bad_frames_and_params():
 
 def test_ws_refuses_requests_beyond_the_queue_limit(monkeypatch):
     monkeypatch.setattr(serve.config, "WORKERS_PER_GPU", 1)
+    monkeypatch.setattr(serve.config, "CPU_WORKERS", 2)
     monkeypatch.setattr(serve.config, "MAX_QUEUE", 2)
-    serve.state.admitted = 3
+    monkeypatch.setattr(serve, "visible_gpu_count", lambda: 1)
+    # 1 GPU worker + 2 CPU workers + 2 queued.
+    serve.state.admitted = 5
     ws = _FakeWs('{"filename": "a.glb"}', b"upload")
     assert "server busy" in _run_ws(ws)
     assert ws.incoming == [b"upload"]  # refused before receiving the upload
-    assert serve.state.admitted == 3
+    assert serve.state.admitted == 5

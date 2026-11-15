@@ -159,12 +159,17 @@ $env:SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE = "0"
 docker compose up -d
 ```
 
-The server runs a pool of worker processes, each with its own copy of the
-model on the GPU and serving one request at a time. `SKINTOKENS_WORKERS`
-(default 2) sets the number of workers **on each visible GPU** (pinned
-round-robin), so up to that many times the number of GPUs are parsed, sampled
-and exported in parallel; further requests queue in FIFO order and receive
-`queue_ahead` heartbeats. Each worker needs roughly 2-4 GB of VRAM. Measure concurrent throughput with:
+The server runs each request in three stages on two pools of worker
+processes: a CPU worker parses the upload and samples its point clouds, a GPU
+worker samples the rig, and a CPU worker exports the result. The CPU and GPU
+stages of different requests overlap: while one request is on the GPU, the
+next is parsed and the previous one exported. Each GPU worker has its own copy
+of the model and runs one inference at a time; `SKINTOKENS_WORKERS`
+(default 2) sets the number of GPU workers **on each visible GPU** (pinned
+round-robin). `SKINTOKENS_CPU_WORKERS` (default 0 = twice the GPU workers) sets
+the number of CPU workers, which load no model and see no GPU. A request
+waiting for a stage queues in FIFO order (exports ahead of new parses) and
+receives `queue_ahead` heartbeats. Each GPU worker needs roughly 2-4 GB of VRAM. Measure concurrent throughput with:
 
 ```powershell
 python load_test.py run --server http://127.0.0.1:8087 --concurrency 4 --requests 12 --out after.json

@@ -50,12 +50,16 @@ HF_PATH = os.environ.get("SKINTOKENS_HF_PATH") or None
 STARTUP_HEARTBEAT_SEC = max(1.0, float(os.environ.get("SKINTOKENS_STARTUP_HEARTBEAT_SEC", "15")))
 SUPPORTED_EXT = {".glb", ".gltf"}
 
-# Worker processes per visible GPU, each with its own copy of the model; the
-# pool starts this many on every GPU (pinned round-robin), so up to
-# WORKERS_PER_GPU * (visible GPUs) requests run fully in parallel
-# (parse, inference and export).
+# GPU worker processes per visible GPU, each with its own copy of the model;
+# the pool starts this many on every GPU (pinned round-robin), so up to
+# WORKERS_PER_GPU * (visible GPUs) requests are sampled on the GPUs at once.
 WORKERS_PER_GPU = env_int("SKINTOKENS_WORKERS", 2, 1, 32)
-# CPU threads per worker for torch/OpenMP (0 = an equal share of the cores).
+# CPU worker processes (no model, no GPU) that parse uploads and export
+# results, beside the GPU workers' inference (0 = twice the GPU workers, so
+# one request's parse and another's export can both overlap each inference).
+CPU_WORKERS = env_int("SKINTOKENS_CPU_WORKERS", 0, 0, 256)
+# CPU threads per worker process for torch/OpenMP (0 = an equal share of the
+# cores among all GPU and CPU workers).
 WORKER_CPU_THREADS = env_int("SKINTOKENS_WORKER_CPU_THREADS", 0, 0, 256)
 
 MAX_NUM_SAMPLES = env_int("SKINTOKENS_MAX_NUM_SAMPLES", 1, 1, 8)
@@ -101,8 +105,14 @@ DETERMINISTIC = env_flag("SKINTOKENS_DETERMINISTIC", False)
 FAST_DECODE_BACKEND = os.environ.get("SKINTOKENS_FAST_DECODE_BACKEND", "cudagraphs").strip().lower()
 
 
+def cpu_workers(gpu_workers: int) -> int:
+    """The number of CPU workers: configured, or twice the GPU workers."""
+    return CPU_WORKERS or 2 * max(1, gpu_workers)
+
+
 def worker_cpu_threads(workers: int) -> int:
-    """Torch/OpenMP threads per worker: configured, or an equal share of the cores."""
+    """Torch/OpenMP threads per worker process: configured, or an equal share
+    of the cores among *workers* processes."""
     if WORKER_CPU_THREADS:
         return WORKER_CPU_THREADS
     return max(1, (os.cpu_count() or 1) // max(1, workers))

@@ -160,10 +160,11 @@ def _pin_worker_gpu(gpu) -> None:
     """Restrict this worker to its assigned physical GPU, before CUDA loads.
 
     *gpu* is the physical index the gateway pinned this worker to (``None``
-    when the pool is not spreading over GPUs). Pinning ``CUDA_VISIBLE_DEVICES``
-    to it makes that GPU the only one this process sees, so the pipeline's
-    ``cuda`` device lands on it. Called at the very start of the process,
-    before any CUDA context exists.
+    when the pool is not spreading over GPUs, ``""`` for a CPU-only worker,
+    which then sees no GPU). Pinning ``CUDA_VISIBLE_DEVICES`` to it makes that
+    GPU the only one this process sees, so the pipeline's ``cuda`` device
+    lands on it. Called at the very start of the process, before any CUDA
+    context exists.
     """
     if gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)

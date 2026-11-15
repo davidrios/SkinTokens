@@ -10,12 +10,13 @@ Covered guarantees:
 """
 
 import asyncio
+import json
 import time
 
 import pytest
 
 import serve
-from conftest import run_with_pool
+from conftest import run_with_pool, run_with_stages
 from src.server.pool import WorkerCrashed
 
 
@@ -57,28 +58,32 @@ def test_requests_run_in_parallel_across_workers():
 
 
 def test_no_cross_contamination_between_concurrent_requests():
-    async def scenario(pool):
+    async def scenario(gpu, cpu):
         return await asyncio.gather(*[
             serve._generate(f"data{i}".encode(), "m.glb", make_params(), f"req{i}")
             for i in range(6)
         ])
 
-    results = run_with_pool(scenario, size=3)
+    results = run_with_stages(scenario, gpu_workers=2, cpu_workers=3)
     for i, samples in enumerate(results):
-        glb, _meta = samples[0]
-        assert glb == f"glb:req{i}:data{i}".encode()
+        payload, _meta = samples[0]
+        upload, spans = payload.split(b"|", 1)
+        assert upload == f"data{i}".encode()
+        assert {span[1] for span in json.loads(spans)} == {f"req{i}"}
     assert serve.state.active_jobs == 0
 
 
 def test_progress_reaches_the_request_callback():
     seen = []
 
-    async def scenario(pool):
+    async def scenario(gpu, cpu):
         await serve._generate(b"x", "m.glb", make_params(), "req",
-                              lambda p, s, e: seen.append((p, s)))
+                              lambda p, s, e: seen.append((p, s, e)))
 
-    run_with_pool(scenario, size=1)
-    assert seen == [(50, "half way")]
+    run_with_stages(scenario)
+    assert [(p, s) for p, s, _ in seen] == [(5, "building dataset")]
+    # Elapsed time is the request's, counted by the gateway from its first stage.
+    assert seen[0][2] >= 0.3
 
 
 def test_waiting_request_gets_queue_heartbeats_in_fifo_order():
@@ -139,21 +144,22 @@ def test_cancel_queued_request_leaves_the_queue():
     assert status["idle"] == 1
 
 
-def test_generate_cancellation_raises_with_reason():
-    async def scenario(pool):
+@pytest.mark.parametrize("cancel_after", [0.1, 0.6])  # during prepare / during inference
+def test_generate_cancellation_raises_with_reason(cancel_after):
+    async def scenario(gpu, cpu):
         cancel = serve.CancellationToken()
-        busy = asyncio.create_task(pool.submit(sleep_job(0.5), b""))
-        await asyncio.sleep(0.05)
         task = asyncio.create_task(serve._generate(b"d", "m.glb", make_params(), "req", None, cancel))
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(cancel_after)
         assert serve.state.active_jobs == 1
         cancel.cancel("client requested cancellation")
         with pytest.raises(serve.GenerationCancelled, match="client requested"):
             await task
-        await busy
+        # Both pools have their workers back.
+        return gpu.status(), cpu.status()
 
-    run_with_pool(scenario, size=1)
+    gpu_status, cpu_status = run_with_stages(scenario)
     assert serve.state.active_jobs == 0
+    assert gpu_status["busy"] == 0 and cpu_status["busy"] == 0
 
 
 # --------------------------------------------------------------------------- #

@@ -15,6 +15,11 @@ runs (the worker is told to stop it and is free again once it has).
 A worker that exits (a crash, a fatal CUDA error, the OOM killer) fails only
 the request it was running; the pool starts a replacement on the same GPU.
 
+A pool with ``cuda=False`` runs CPU-only workers, which see no GPU at all
+(the server's CPU stages, :mod:`src.server.stages`). A request submitted with
+``urgent=True`` waits ahead of all non-urgent ones (in FIFO order among the
+urgent), so a request's last stage is not stuck behind new requests' first.
+
 Adapted from the AnyCross server's worker pool.
 """
 from __future__ import annotations
@@ -113,7 +118,7 @@ class _Worker:
             target=worker_module.main,
             args=(pool.spec, jobs_read, events_write, pool.options,
                   pool._gpu_for_slot(slot)),
-            name=f"skintokens-worker-{slot}",
+            name=f"skintokens-{pool.label}-{slot}",
         )
         self.process.start()
         # Only the child keeps these ends, so its exit closes the pipes.
@@ -132,7 +137,7 @@ class _Worker:
 
     @property
     def name(self) -> str:
-        return f"worker {self.slot} (pid {self.process.pid})"
+        return f"{self.pool.label} {self.slot} (pid {self.process.pid})"
 
     def _read(self) -> None:
         loop = self.pool._loop
@@ -244,15 +249,24 @@ class WorkerPool:
 
     *spec* names the worker's :class:`src.server.worker.ServiceSpec` as
     ``"module:NAME"``; *options* reach every worker's ``load``.
+
+    With ``cuda=False`` the workers see no GPU (``CUDA_VISIBLE_DEVICES`` is
+    empty) and *visible_gpus* must stay 1: *per_gpu* is then the pool size.
+    *label* names the workers in logs and process names.
     """
 
     def __init__(self, spec: str, per_gpu: int, *, visible_gpus: int = 1,
-                 options: Optional[dict] = None, restart_delay: float = 5.0) -> None:
+                 options: Optional[dict] = None, restart_delay: float = 5.0,
+                 cuda: bool = True, label: str = "worker") -> None:
         per_gpu = int(per_gpu)
         visible_gpus = max(1, int(visible_gpus))
         if per_gpu < 1:
             raise ValueError(f"the pool needs at least one worker per GPU, got {per_gpu}")
+        if not cuda and visible_gpus != 1:
+            raise ValueError("a CPU-only pool is not spread over GPUs")
         self.spec = spec
+        self.cuda = cuda
+        self.label = label
         self.per_gpu = per_gpu
         self.gpus = visible_gpus
         # One worker per (GPU, per-GPU slot): per_gpu workers on each card.
@@ -265,17 +279,22 @@ class WorkerPool:
         self._workers: list[_Worker] = []
         self._idle: deque[_Worker] = deque()
         self._waiters: deque[asyncio.Future] = deque()
+        # The waiters of urgent requests, all ahead of the others in _waiters.
+        self._urgent: set[asyncio.Future] = set()
         self._ids = itertools.count(1)
         self._closing = False
         self._respawns: set[asyncio.Task] = set()
 
-    def _gpu_for_slot(self, slot: int) -> Optional[int]:
-        """The physical GPU *slot* runs on, or ``None`` for a single-GPU pool.
+    def _gpu_for_slot(self, slot: int) -> Optional[int | str]:
+        """The physical GPU *slot* runs on, ``None`` for a single-GPU pool, or
+        ``""`` (no GPU visible) for a CPU-only pool.
 
         Slots fill the cards round-robin (slot ``g`` of each GPU), so a pool of
         *per_gpu* workers over *gpus* cards gives card *k* the slots
         ``k, k + gpus, k + 2 gpus, ...``.
         """
+        if not self.cuda:
+            return ""
         if self.gpus <= 1:
             return None
         return slot % self.gpus
@@ -295,10 +314,14 @@ class WorkerPool:
         self.info = self._workers[0].info
         for worker in self._workers:
             self._release(worker)
-        logger.info("worker pool ready: %d worker%s across %d GPU%s (%d per GPU) in %.1fs",
-                    self.size, "" if self.size == 1 else "s",
-                    self.gpus, "" if self.gpus == 1 else "s",
-                    self.per_gpu, time.monotonic() - started)
+        if self.cuda:
+            logger.info("%s pool ready: %d worker%s across %d GPU%s (%d per GPU) in %.1fs",
+                        self.label, self.size, "" if self.size == 1 else "s",
+                        self.gpus, "" if self.gpus == 1 else "s",
+                        self.per_gpu, time.monotonic() - started)
+        else:
+            logger.info("%s pool ready: %d CPU-only worker%s in %.1fs", self.label,
+                        self.size, "" if self.size == 1 else "s", time.monotonic() - started)
 
     async def close(self, timeout: float = 30.0) -> None:
         """Stop the workers; running jobs finish first, up to *timeout* seconds."""
@@ -387,8 +410,18 @@ class WorkerPool:
         """Whether a request submitted now would wait for a worker."""
         return not self._idle or bool(self._waiters)
 
+    def _enqueue(self, waiter: asyncio.Future, urgent: bool) -> None:
+        if not urgent:
+            self._waiters.append(waiter)
+            return
+        position = 0
+        while position < len(self._waiters) and self._waiters[position] in self._urgent:
+            position += 1
+        self._urgent.add(waiter)
+        self._waiters.insert(position, waiter)
+
     async def _acquire(self, queue_callback: Optional[QueueCallback], queue_phase: str,
-                       cancelled: Optional[asyncio.Event]) -> _Worker:
+                       cancelled: Optional[asyncio.Event], urgent: bool = False) -> _Worker:
         if self._closing:
             raise RuntimeError("the server is shutting down")
         if cancelled is not None and cancelled.is_set():
@@ -396,7 +429,7 @@ class WorkerPool:
         if self._idle and not self._waiters:
             return self._idle.popleft()
         waiter = self._loop.create_future()
-        self._waiters.append(waiter)
+        self._enqueue(waiter, urgent)
         heartbeat = None
         if queue_callback is not None:
             started = time.monotonic()
@@ -428,6 +461,7 @@ class WorkerPool:
             leave()
             raise
         finally:
+            self._urgent.discard(waiter)
             # Not awaited: an await here could lose a worker already handed over.
             if heartbeat is not None:
                 heartbeat.cancel()
@@ -449,7 +483,8 @@ class WorkerPool:
                      queue_callback: Optional[QueueCallback] = None,
                      queue_phase: str = "worker",
                      cancelled: Optional[asyncio.Event] = None,
-                     cancel_reason: Callable[[], str] = lambda: "generation cancelled") -> Any:
+                     cancel_reason: Callable[[], str] = lambda: "generation cancelled",
+                     urgent: bool = False) -> Any:
         """Run one request on the next free worker and return its result.
 
         *on_start* is awaited when the request gets a worker; *on_progress*
@@ -462,10 +497,12 @@ class WorkerPool:
         :class:`GenerationCancelled`, a running job only once the worker has
         really stopped it (so its worker is free again). Cancelling the call
         itself also asks the worker to stop the job.
+
+        An *urgent* request waits ahead of every non-urgent one.
         """
         started = False
         while True:
-            worker = await self._acquire(queue_callback, queue_phase, cancelled)
+            worker = await self._acquire(queue_callback, queue_phase, cancelled, urgent)
             if not started:
                 started = True
                 try:

@@ -212,17 +212,17 @@ def test_corrupt_zlib_data_is_a_value_error(tmp_path):
 # server
 # --------------------------------------------------------------------------- #
 def test_pipeline_exports_rig_payloads_that_rebuild_its_glbs(tmp_path):
-    from src.server import pipeline
+    from src.server import stages
     from src.server.config import GenParams
     from src.server.worker import Cancellation
 
     path = _instances(tmp_path / "input.glb")
-    source = pipeline.Upload(path.read_bytes(), "input.glb")
+    source = stages.Upload(path.read_bytes(), "input.glb")
     results = {}
     for output in ("glb", "rig"):
         asset, skin = _predicted(path, 3, False)
         asset.skin = skin
-        results[output] = pipeline.export_samples(
+        results[output] = stages.export_samples(
             [SimpleNamespace(asset=asset)], GenParams(seed=1, output=output), "t",
             Cancellation(), None, source=source)
     assert len(results["rig"]) == 1
@@ -245,6 +245,8 @@ class _PoolWs(_FakeWs):
 
 
 class _FakePool:
+    """Either pool: the stages hand on placeholders."""
+
     def __init__(self):
         self.params = None
 
@@ -253,6 +255,13 @@ class _FakePool:
 
     async def submit(self, params, upload, **kwargs):
         self.params = params
+        stage = params.get("stage", "infer")
+        if stage == "prepare":
+            return {"infer": b"points", "export": b"scene"}
+        if stage == "infer":
+            assert upload == b"points"
+            return b"predictions"
+        assert upload == (b"scene", b"predictions")
         return [b"payload:" + params["output"].encode()]
 
 
@@ -263,7 +272,8 @@ class _FakePool:
 ])
 def test_supported_output_reaches_the_worker_and_the_done_message(monkeypatch, formats, header, output):
     monkeypatch.setattr(serve.config, "OUTPUT_FORMATS", formats)
-    pool = serve.state.pool = _FakePool()
+    serve.state.pool = _FakePool()
+    pool = serve.state.cpu_pool = _FakePool()
     ws = _PoolWs(json.dumps({"filename": "a.glb", **header}), b"upload", hang=True)
     asyncio.run(serve.ws_generate(ws))
     assert pool.params["output"] == output

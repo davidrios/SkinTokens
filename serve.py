@@ -2,13 +2,23 @@
 SkinTokens / TokenRig inference server — FastAPI persistent service.
 
 This process is the gateway: it holds the WebSocket connections and loads no
-model. Generation runs in a pool of worker processes (``src/server/pool.py``),
-each with its own copy of the model resident in VRAM and running one request at
-a time. The pool runs ``SKINTOKENS_WORKERS`` workers **on each** visible GPU
-(pinned round-robin, each worker sees its card as ``cuda:0``), so up to
-``SKINTOKENS_WORKERS * (visible GPUs)`` requests are parsed, sampled on the GPU
-and exported fully in parallel. Further requests wait for a free worker in
-FIFO order and get a once-per-second queue heartbeat meanwhile.
+model. A request runs in three stages on two pools of worker processes
+(``src/server/pool.py``), so the CPU and GPU work of different requests
+overlap:
+
+1. ``prepare`` on a CPU worker: parse the upload, sample the point clouds.
+2. ``infer`` on a GPU worker: sample the rig, interpolate its skin.
+3. ``export`` on a CPU worker: build the rig payload or GLB.
+
+Each GPU worker has its own copy of the model resident in VRAM and runs one
+request's inference at a time; the GPU pool runs ``SKINTOKENS_WORKERS``
+workers **on each** visible GPU (pinned round-robin, each worker sees its card
+as ``cuda:0``). The CPU workers (``SKINTOKENS_CPU_WORKERS``) load no model and
+see no GPU (``src/server/stages.py``). So with one GPU worker, the next
+request is parsed while the current one is on the GPU, and the previous one
+is exported meanwhile. A request waits for each stage's free worker in FIFO
+order (exports ahead of new parses) and gets a once-per-second queue
+heartbeat meanwhile.
 
 Clients submit a 3D file (GLB/GLTF) and receive, over WebSocket, a rig payload
 (skeleton and skin only; the client adds it to the file it uploaded, see
@@ -20,16 +30,19 @@ Run:
     python serve.py --host 0.0.0.0 --port 8087
 
 Environment variables:
-    SKINTOKENS_WORKERS        Worker processes per GPU / parallel requests per
-                              GPU (default 2); total workers = this times the
-                              number of visible GPUs
+    SKINTOKENS_WORKERS        GPU worker processes per GPU / parallel inferences
+                              per GPU (default 2); total GPU workers = this
+                              times the number of visible GPUs
+    SKINTOKENS_CPU_WORKERS    CPU worker processes for parsing and export
+                              (default 0 = twice the GPU workers)
     SKINTOKENS_MODEL_CKPT     Path to the model checkpoint
     SKINTOKENS_HF_PATH        Optional HuggingFace model path
     SKINTOKENS_DEVICE         Device override (default: cuda if available)
     SKINTOKENS_ENABLE_GLB_OUTPUT  1 to also serve "output": "glb" (whole GLBs,
                               several times larger); default: rig payloads only
-    SKINTOKENS_MAX_QUEUE      Requests that may wait for a worker (default 16);
-                              more are refused with "server busy"
+    SKINTOKENS_MAX_QUEUE      Requests that may wait beyond the ones the workers
+                              hold (default 16); more are refused with
+                              "server busy"
     SKINTOKENS_HEADER_TIMEOUT_SEC / SKINTOKENS_UPLOAD_TIMEOUT_SEC
                               Time a client has to send its header (30) / file (300)
     SKINTOKENS_MAX_UPLOAD_MB, SKINTOKENS_INPUT_*  Upload size and geometry limits
@@ -65,7 +78,8 @@ from src.server.config import GenParams, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB, SUPPOR
 from src.server.pool import WorkerPool
 from src.server.worker import GenerationCancelled
 
-WORKER_SPEC = "src.server.pipeline:SERVICE"
+WORKER_SPEC = "src.server.pipeline:SERVICE"  # the GPU stage
+CPU_WORKER_SPEC = "src.server.stages:SERVICE"  # the CPU stages
 
 
 def new_request_id() -> str:
@@ -82,7 +96,8 @@ def new_request_id() -> str:
 # Global state
 # --------------------------------------------------------------------------- #
 class ServerState:
-    pool: Optional[WorkerPool] = None
+    pool: Optional[WorkerPool] = None  # GPU workers: inference
+    cpu_pool: Optional[WorkerPool] = None  # CPU workers: parsing and export
     ready: bool = False
     loaded_at: float = 0.0
     active_jobs: int = 0
@@ -172,8 +187,13 @@ def visible_gpu_count() -> int:
     return max(1, int(count))
 
 
+def _gpu_workers() -> int:
+    return config.WORKERS_PER_GPU * visible_gpu_count()
+
+
 def _admission_limit() -> int:
-    return config.WORKERS_PER_GPU * visible_gpu_count() + config.MAX_QUEUE
+    gpu_workers = _gpu_workers()
+    return gpu_workers + config.cpu_workers(gpu_workers) + config.MAX_QUEUE
 
 
 def _client_error_message(exc: BaseException, request_id: str) -> str:
@@ -205,12 +225,16 @@ async def _generate(
     cancellation: Optional[CancellationToken] = None,
     queue_callback=None,
 ):
-    """Run one generation on the next free worker.
+    """Run one generation: ``prepare`` on a CPU worker, ``infer`` on a GPU
+    worker, ``export`` on a CPU worker, each on the next free one.
 
     ``progress_callback(percent, stage, elapsed)`` is called on the event loop
-    for each progress event of the job. ``queue_callback`` (async) is invoked
-    once per second with ``(phase, waited_sec, queue_ahead)`` while the request
-    waits for a worker.
+    for each progress event of the stages, ``elapsed`` counted from when the
+    first stage started. ``queue_callback`` (async) is invoked once per second
+    with ``(phase, waited_sec, queue_ahead)`` while the request waits for a
+    worker, ``phase`` being the stage it waits for.
+
+    The stages hand their data on as packed bytes the gateway only forwards.
 
     Returns:
         List of (payload_bytes, meta_dict) tuples, one per sample (meta is
@@ -219,33 +243,45 @@ async def _generate(
     cancellation = cancellation or CancellationToken()
     suffix = _validate_upload(file_data, filename)
     cancellation.raise_if_cancelled()
-    if state.pool is None:
+    if state.pool is None or state.cpu_pool is None:
         raise RuntimeError("model still loading")
 
+    # Every stage samples under seeds derived from this one.
+    job = {**params.with_seed().model_dump(), "request_id": request_id}
     logger.debug("[%s] submitted queued=%s filename=%r", request_id,
-                state.pool.would_queue(), filename)
+                 state.cpu_pool.would_queue(), filename)
     wait_started = time.monotonic()
+    started: Optional[float] = None
 
     async def on_start():
-        logger.debug("[%s] worker acquired after %.2fs", request_id,
-                    time.monotonic() - wait_started)
+        nonlocal started
+        started = time.monotonic()
+        logger.debug("[%s] CPU worker acquired after %.2fs", request_id,
+                     started - wait_started)
 
     def on_progress(event: dict):
         if progress_callback is not None:
-            progress_callback(event["progress"], event["step"], event["elapsed_sec"])
+            progress_callback(event["progress"], event["step"],
+                              round(time.monotonic() - (started or wait_started), 2))
 
+    stage_options = dict(
+        on_progress=on_progress,
+        queue_callback=queue_callback,
+        cancelled=cancellation.event,
+        cancel_reason=lambda: cancellation.reason,
+    )
     state.active_jobs += 1
     try:
-        outputs = await state.pool.submit(
-            {**params.model_dump(), "suffix": suffix, "request_id": request_id},
-            file_data,
-            on_start=on_start,
-            on_progress=on_progress,
-            queue_callback=queue_callback,
-            queue_phase="worker",
-            cancelled=cancellation.event,
-            cancel_reason=lambda: cancellation.reason,
-        )
+        prepared = await state.cpu_pool.submit(
+            {**job, "stage": "prepare", "suffix": suffix}, file_data,
+            on_start=on_start, queue_phase="prepare", **stage_options)
+        del file_data
+        predictions = await state.pool.submit(
+            job, prepared["infer"], queue_phase="infer", **stage_options)
+        # A request near its end goes ahead of new requests' parsing.
+        outputs = await state.cpu_pool.submit(
+            {**job, "stage": "export"}, (prepared["export"], predictions),
+            queue_phase="export", urgent=True, **stage_options)
     except GenerationCancelled:
         raise GenerationCancelled(cancellation.reason) from None
     finally:
@@ -313,33 +349,54 @@ class _WsOutbox:
 # --------------------------------------------------------------------------- #
 # FastAPI app
 # --------------------------------------------------------------------------- #
+def _cpu_threads() -> int:
+    gpu_workers = _gpu_workers()
+    return config.worker_cpu_threads(gpu_workers + config.cpu_workers(gpu_workers))
+
+
 def _worker_options() -> dict:
     return {"model_ckpt": config.MODEL_CKPT, "hf_path": config.HF_PATH,
-            "cpu_threads": config.worker_cpu_threads(
-                config.WORKERS_PER_GPU * visible_gpu_count())}
+            "cpu_threads": _cpu_threads()}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     gpus = visible_gpu_count()
     total = config.WORKERS_PER_GPU * gpus
-    logger.info("Starting %d worker process%s (%d per GPU across %d GPU%s)",
+    cpu_total = config.cpu_workers(total)
+    logger.info("Starting %d GPU worker process%s (%d per GPU across %d GPU%s) "
+                "and %d CPU worker process%s",
                 total, "" if total == 1 else "es",
-                config.WORKERS_PER_GPU, gpus, "" if gpus == 1 else "s")
+                config.WORKERS_PER_GPU, gpus, "" if gpus == 1 else "s",
+                cpu_total, "" if cpu_total == 1 else "es")
     pool = WorkerPool(WORKER_SPEC, config.WORKERS_PER_GPU, visible_gpus=gpus,
-                      options=_worker_options())
-    await pool.start()
+                      options=_worker_options(), label="gpu-worker")
+    await pool.start()  # closes its workers itself if it fails
+    try:
+        # The CPU workers build the model's input transform from the config a
+        # GPU worker reported (they load no model).
+        cpu_pool = WorkerPool(CPU_WORKER_SPEC, cpu_total, cuda=False, label="cpu-worker",
+                              options={"predict_transform": pool.info["predict_transform"],
+                                       "cpu_threads": _cpu_threads()})
+        await cpu_pool.start()
+    except BaseException:
+        await pool.close()
+        raise
     state.pool = pool
+    state.cpu_pool = cpu_pool
     state.ready = True
     state.loaded_at = time.time()
-    logger.info("Pipeline ready: %d worker%s (%s)", total,
-                "" if total == 1 else "s", pool.info)
+    logger.info("Pipeline ready: %d GPU worker%s, %d CPU worker%s (%s)",
+                total, "" if total == 1 else "s", cpu_total, "" if cpu_total == 1 else "s",
+                {k: v for k, v in pool.info.items() if k != "predict_transform"})
     try:
         yield
     finally:
         state.ready = False
         state.pool = None
-        await pool.close()
+        state.cpu_pool = None
+        # Stopped together: each lets its running jobs finish first.
+        await asyncio.gather(pool.close(), cpu_pool.close())
 
 
 app = FastAPI(title="SkinTokens / TokenRig Inference Server", version="1.0",
@@ -348,9 +405,10 @@ app = FastAPI(title="SkinTokens / TokenRig Inference Server", version="1.0",
 
 @app.get("/health")
 async def health():
-    if not state.ready or state.pool is None:
+    if not state.ready or state.pool is None or state.cpu_pool is None:
         return JSONResponse({"status": "loading"}, status_code=503)
     pool = state.pool.status()
+    cpu_pool = state.cpu_pool.status()
     return {
         "status": "ok",
         "busy": state.busy,
@@ -358,8 +416,10 @@ async def health():
         "admitted": state.admitted,
         "max_admitted": _admission_limit(),
         "workers": pool["workers"],
+        "cpu_workers": cpu_pool["workers"],
         "pool": pool,
-        "queue_depth": pool["queued"],
+        "cpu_pool": cpu_pool,
+        "queue_depth": pool["queued"] + cpu_pool["queued"],
         "output_formats": list(config.OUTPUT_FORMATS),
     }
 
@@ -537,7 +597,7 @@ async def ws_generate(ws: WebSocket):
         record.header_valid = True
         logger.debug("[%s] WebSocket generation request received", request_id)
 
-        if not state.ready or state.pool is None:
+        if not state.ready or state.pool is None or state.cpu_pool is None:
             await reject("model still loading")
             return
 
@@ -592,7 +652,9 @@ async def ws_generate(ws: WebSocket):
                          "waited_sec": waited_sec, "queue_ahead": queue_ahead,
                          "request_id": request_id})
 
-        queued = state.pool.would_queue()
+        # Whether this request is to wait for a worker: to parse it, or for
+        # the GPU it will need next.
+        queued = state.cpu_pool.would_queue() or state.pool.would_queue()
         logger.debug("[%s] queued=%s", request_id, queued)
         outbox.post({"stage": "queued", "queued": queued, "request_id": request_id})
         outbox.post({"stage": "processing", "progress": 0, "request_id": request_id})
@@ -694,15 +756,21 @@ def main():
     parser.add_argument("--model-ckpt", default=config.MODEL_CKPT)
     parser.add_argument("--hf-path", default=config.HF_PATH)
     parser.add_argument("--workers", type=int, default=config.WORKERS_PER_GPU,
-                        help="worker processes per GPU (parallel requests per "
+                        help="GPU worker processes per GPU (parallel inferences per "
                              "GPU); SKINTOKENS_WORKERS")
+    parser.add_argument("--cpu-workers", type=int, default=config.CPU_WORKERS,
+                        help="CPU worker processes for parsing and export "
+                             "(0 = twice the GPU workers); SKINTOKENS_CPU_WORKERS")
     args = parser.parse_args()
 
     if args.workers < 1:
         parser.error("--workers must be at least 1")
+    if args.cpu_workers < 0:
+        parser.error("--cpu-workers must not be negative")
     config.MODEL_CKPT = args.model_ckpt
     config.HF_PATH = args.hf_path
     config.WORKERS_PER_GPU = args.workers
+    config.CPU_WORKERS = args.cpu_workers
 
     import uvicorn
 
@@ -724,7 +792,7 @@ def main():
                "datefmt": LOG_DATE_FORMAT}
         for name, formatter in uvicorn.config.LOGGING_CONFIG["formatters"].items()
     }
-    # One gateway process (uvicorn workers=1): the model workers are the pool's.
+    # One gateway process (uvicorn workers=1): the model workers are the pools'.
     # No per-message deflate: uploads and rigged GLBs are mostly float data that
     # barely compresses, and zlib-ing tens of MB (on the event loop, stalling
     # every other connection) cost ~2s per request on a 24 MB upload.

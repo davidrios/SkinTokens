@@ -21,11 +21,14 @@ services:
       SKINTOKENS_DEVICE: cuda
       SKINTOKENS_HOST: 0.0.0.0
       SKINTOKENS_PORT: 8000
-      # Worker processes per GPU, each with its own model copy (~2-4 GB VRAM);
-      # the total is this count times the number of visible GPUs (workers are
-      # pinned to the cards round-robin), and up to that many requests run in
-      # parallel.
+      # GPU worker processes per GPU, each with its own model copy (~2-4 GB
+      # VRAM); the total is this count times the number of visible GPUs
+      # (workers are pinned to the cards round-robin), and up to that many
+      # requests are on the GPUs at once.
       SKINTOKENS_WORKERS: ${SKINTOKENS_WORKERS:-1}
+      # CPU worker processes (no model, no GPU) that parse uploads and export
+      # results beside the GPU work; 0 = twice the GPU workers.
+      SKINTOKENS_CPU_WORKERS: ${SKINTOKENS_CPU_WORKERS:-0}
       SKINTOKENS_MAX_NUM_SAMPLES: ${SKINTOKENS_MAX_NUM_SAMPLES:-1}
       SKINTOKENS_MAX_NEW_TOKENS: 2048
       # Results are rig payloads (skeleton + skin; clients add them to the file
