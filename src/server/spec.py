@@ -79,6 +79,12 @@ def get_model(
         del a
         gc.collect()
 
+    # Inference never encodes a skin (generate() only encodes the shape
+    # condition and decodes skin tokens), so the VAE's skin encoder is
+    # training-only weight; dropped after the strict checkpoint load.
+    model.vae.model.encoder = None
+    model.vae.model.quant = None
+
     model = model.to(device)
     if hasattr(model.transformer, "config") and hasattr(model.transformer.config, "use_cache"):
         raw_use_cache = os.environ.get("SKINTOKENS_USE_CACHE", "1")

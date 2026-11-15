@@ -35,6 +35,9 @@ LLM_LOCAL_DIR = resolve_model_path("models/Qwen3-0.6B")
 # Each joint replicates the point-cloud condition once, so this is bounded to
 # keep peak VRAM in check; override via SKINTOKENS_DECODE_JOINT_BATCH.
 DECODE_JOINT_BATCH = max(1, int(os.environ.get("SKINTOKENS_DECODE_JOINT_BATCH", "8")))
+# Rows (joints x points) per call of the VAE's point head, which bounds the
+# skin decode's peak VRAM (~16 KiB a row); override via SKINTOKENS_DECODE_POINT_ROWS.
+DECODE_POINT_ROWS = max(1, int(os.environ.get("SKINTOKENS_DECODE_POINT_ROWS", "16384")))
 
 # Decoding is fixed to greedy single-beam search (TokenRig.generate sets these);
 # passing any of them is a caller bug.
@@ -856,29 +859,40 @@ def decode(
             'skin_pred': None,
             'detokenize_output': detokenize_output,
         }
-    cond = cond.unsqueeze(0)
+    model = vae.model
+    N = cond.shape[0]
+    # The point head's queries depend only on the points, not on the joint:
+    # embedded once and shared by every joint (broadcast, not copied).
+    queries = None
     cond_latents = cond_latents.unsqueeze(0)
-    skin = []
-    g = tokens_per_skin * encode_repeat
+    skin = torch.empty((N, J), dtype=torch.float32, device=cond.device)
+    b_max = max(1, encode_repeat)
+    # Points per head call: the head's activations (~16 KiB a row, rows =
+    # joints x points) dominate decode memory, so they are bounded by rows.
+    point_chunk = max(1, DECODE_POINT_ROWS // b_max)
     progress_span = max(1, decode_progress_end - decode_progress_start)
-    total_steps = max(1, (J * tokens_per_skin + g - 1) // g)
-    for step_idx, s in enumerate(range(0, J*tokens_per_skin, g)):
-        t = min(s+g, J*tokens_per_skin)
-        indices = skin_tokens[s:t].unsqueeze(0) - tokenizer.vocab_size
-        # expect: (b, tokens_per_skin, dim)
-        b = (t-s)//tokens_per_skin
-        z = vae.model.FSQ.indices_to_codes(indices).reshape(b, tokens_per_skin, -1)
-        # (b, n, 1)
-        logits = vae.decode(z=z, sampled_cond=cond.repeat(b, 1, 1), cond_tokens=cond_latents.repeat(b, 1, 1))
-        skin_pred = logits.reshape(b, logits.shape[1]).permute(1, 0)
-        skin.append(skin_pred)
+    total_steps = max(1, (J + b_max - 1) // b_max)
+    for step_idx, j0 in enumerate(range(0, J, b_max)):
+        j1 = min(j0 + b_max, J)
+        b = j1 - j0
+        indices = skin_tokens[j0 * tokens_per_skin:j1 * tokens_per_skin].unsqueeze(0) - tokenizer.vocab_size
+        z = model.FSQ.indices_to_codes(indices).reshape(b, tokens_per_skin, -1)
+        if vae.sample_tokens != vae.compress_tokens:
+            z = vae.up_perceiver(z)
+        kv = model.decode_latents(z, cond_latents.expand(b, -1, -1))
+        if queries is None:
+            queries = model.embed_points(cond.unsqueeze(0), kv.dtype)
+        for p0 in range(0, N, point_chunk):
+            p1 = min(p0 + point_chunk, N)
+            logits = model.decode_points(kv, queries[:, p0:p1].expand(b, -1, -1))  # (b, n, 1)
+            skin[p0:p1, j0:j1] = logits[..., 0].transpose(0, 1)
+            del logits
+        del kv, z
 
         if progress_callback is not None:
             pct = decode_progress_start + (progress_span * (step_idx + 1)) // total_steps
-            joint_idx = min((t) // tokens_per_skin, J)
-            progress_callback(min(pct, decode_progress_end), f"decoding joints ({joint_idx}/{J})")
+            progress_callback(min(pct, decode_progress_end), f"decoding joints ({j1}/{J})")
 
-    skin = torch.concat(skin, dim=1).float()
     return {
         'skin_pred': skin,
         'detokenize_output': detokenize_output,

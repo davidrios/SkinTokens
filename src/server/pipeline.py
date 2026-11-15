@@ -20,9 +20,13 @@ from __future__ import annotations
 import os
 
 os.environ.setdefault("XFORMERS_IGNORE_FLASH_VERSION_CHECK", "1")
-# expandable_segments needs CUDA VMM APIs, which WSL2 (/dev/dxg) lacks; recent
-# torch then fails every allocation with "CUDA driver error: unknown error".
-if not os.path.exists("/dev/dxg"):
+import sys
+
+# expandable_segments (less fragmentation, so a lower reserved peak) needs the
+# CUDA VMM APIs, so it is enabled on native Linux only: Windows (WDDM) ignores
+# it, and under WSL2 (/dev/dxg, e.g. Docker Desktop) recent torch fails every
+# allocation with "CUDA driver error: unknown error".
+if sys.platform.startswith("linux") and not os.path.exists("/dev/dxg"):
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import dataclasses
@@ -102,10 +106,13 @@ def _get_fast_decode_compile_config():
                 backend="inductor", mode="reduce-overhead", fullgraph=False
             )
         else:
-            # Triton-free CUDA-graph capture (no fusion). The ``cudagraphs`` backend
-            # rejects the ``mode`` argument, so it must be left unset.
+            # Triton-free CUDA-graph capture (no fusion), with the weights and KV
+            # cache as static inputs rather than copied into the graph each step
+            # (src/model/cudagraph_backend.py). The backend rejects the ``mode``
+            # argument, so it must be left unset.
+            from src.model import cudagraph_backend
             _fast_decode_compile_config = CompileConfig(
-                backend="cudagraphs", mode=None, fullgraph=False
+                backend=cudagraph_backend.register(), mode=None, fullgraph=False
             )
     return _fast_decode_compile_config
 

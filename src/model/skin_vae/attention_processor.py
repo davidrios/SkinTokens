@@ -28,6 +28,36 @@ except Exception as e:
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+# Key/value rows per chunk when a cross-attention's keys are built in chunks
+# (inference with more than this many keys: the shape encoder's ~54k points).
+CROSS_KV_CHUNK = 8192
+
+
+def _cross_key_value_chunked(attn: Attention, encoder_hidden_states: torch.Tensor):
+    """Cross-attention keys and values ``(B, L, heads, head_dim)`` each, built
+    ``CROSS_KV_CHUNK`` rows at a time into preallocated tensors.
+
+    Each row's norm and projections depend on that row only, so this gives the
+    unchunked values while holding only one chunk's fp32 norm output and
+    concatenated key/value at a time, not the whole sequence's."""
+    batch_size, length, _ = encoder_hidden_states.shape
+    key = value = None
+    for start in range(0, length, CROSS_KV_CHUNK):
+        chunk = encoder_hidden_states[:, start:start + CROSS_KV_CHUNK]
+        if attn.norm_cross:
+            chunk = attn.norm_encoder_hidden_states(chunk)
+        # Heads are split before key/value (see the note in __call__).
+        kv = torch.cat((attn.to_k(chunk), attn.to_v(chunk)), dim=-1)
+        split_size = kv.shape[-1] // attn.heads // 2
+        kv = kv.view(batch_size, -1, attn.heads, split_size * 2)
+        if key is None:
+            key = kv.new_empty((batch_size, length, attn.heads, split_size))
+            value = torch.empty_like(key)
+        key[:, start:start + kv.shape[1]] = kv[..., :split_size]
+        value[:, start:start + kv.shape[1]] = kv[..., split_size:]
+        del kv, chunk
+    return key, value
+
 
 class Tripo2AttnProcessor2_0:
     r"""
@@ -87,19 +117,28 @@ class Tripo2AttnProcessor2_0:
 
         query = attn.to_q(hidden_states)
 
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
-        elif attn.norm_cross:
-            encoder_hidden_states = attn.norm_encoder_hidden_states(
-                encoder_hidden_states
-            )
+        chunk_kv = (attn.is_cross_attention and encoder_hidden_states is not None
+                    and not torch.is_grad_enabled()
+                    and encoder_hidden_states.shape[1] > CROSS_KV_CHUNK)
+        if chunk_kv:
+            # Already split per head.
+            key, value = _cross_key_value_chunked(attn, encoder_hidden_states)
+        else:
+            if encoder_hidden_states is None:
+                encoder_hidden_states = hidden_states
+            elif attn.norm_cross:
+                encoder_hidden_states = attn.norm_encoder_hidden_states(
+                    encoder_hidden_states
+                )
 
-        key = attn.to_k(encoder_hidden_states)
-        value = attn.to_v(encoder_hidden_states)
+            key = attn.to_k(encoder_hidden_states)
+            value = attn.to_v(encoder_hidden_states)
 
         # NOTE that tripo2 split heads first then split qkv or kv, like .view(..., attn.heads, 3, dim)
         # instead of .view(..., 3, attn.heads, dim). So we need to re-split here.
-        if not attn.is_cross_attention:
+        if chunk_kv:
+            pass
+        elif not attn.is_cross_attention:
             qkv = torch.cat((query, key, value), dim=-1)
             split_size = qkv.shape[-1] // attn.heads // 3
             qkv = qkv.view(batch_size, -1, attn.heads, split_size * 3)

@@ -294,7 +294,38 @@ class SkinFSQCVAEModel(ModelMixin, ConfigMixin):
             dec.append(z)
 
         return torch.cat(dec, dim=1)
-    
+
+    # The decoder split in its two parts, for callers that decode many skins
+    # against the same points (see src.model.tokenrig.decode): the latent stack
+    # runs once per skin, the point head over the points in chunks.
+    def decode_latents(self, z: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """The decoder's self-attention stack over one skin's latent tokens and
+        the shape condition: ``(b, T, width)``, the point head's key/values."""
+        hidden_states = self.post_quant(torch.cat([z, cond], dim=1))
+        for block in self.decoder.blocks[:-1]:
+            hidden_states = block(hidden_states)
+        return hidden_states
+
+    def embed_points(self, sampled_points: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """The point head's queries for ``sampled_points`` ``(B, N, 6)``, which
+        do not depend on the skin: ``(B, N, width)``. ``dtype`` is the latent
+        stack's (``_decode`` embeds the points in it)."""
+        queries = sampled_points.to(dtype=dtype)
+        positions, features = queries[..., :3], queries[..., 3:]
+        return self.decoder.proj_query(torch.cat([self.embedder(positions), features], dim=-1))
+
+    def decode_points(self, kv: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
+        """The point head: per-point weights ``(b, n, 1)`` from the key/values
+        ``kv`` of :meth:`decode_latents` and queries of :meth:`embed_points`.
+        Each point is independent of the others, so any chunk of the points
+        gives the same values as the whole."""
+        block = self.decoder.blocks[-1]
+        if self.decoder.is_miche:
+            hidden_states = block(queries, kv)
+        else:
+            hidden_states = block(queries, encoder_hidden_states=kv)
+        return self.decoder.sigmoid(self.decoder.proj_out(self.decoder.norm_out(hidden_states)))
+
 
     def forward(self, x: torch.Tensor):
         pass
