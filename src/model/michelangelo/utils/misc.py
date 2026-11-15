@@ -21,10 +21,9 @@ def calc_num_train_steps(num_data, batch_size, max_epochs, num_nodes, num_cards=
     return int(num_data / (num_nodes * num_cards * batch_size)) * max_epochs
 
 
-# register_resolver is omegaconf's deprecated legacy API (string-only arguments);
-# register_new_resolver is its replacement. replace=True keeps re-imports safe.
-OmegaConf.register_new_resolver("calc_num_train_steps", calc_num_train_steps, replace=True)
-OmegaConf.register_new_resolver("mul", lambda a, b: a * b, replace=True)
+# OmegaConf 2.4 uses register_resolver; replace=True keeps re-imports safe.
+OmegaConf.register_resolver("calc_num_train_steps", calc_num_train_steps, replace=True)
+OmegaConf.register_resolver("mul", lambda a, b: a * b, replace=True)
 
 @dataclass
 class ExperimentConfig:
