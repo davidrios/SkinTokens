@@ -325,7 +325,7 @@ def _bin_buffer(document, data: dict) -> bytes:
     return bytes(blob)
 
 
-def apply_rig(source, payload, *, name: Optional[str] = None) -> bytes:
+def apply_rig(source, payload, *, name: Optional[str] = None, auto_ground: bool = False) -> bytes:
     """The input file with the payload's rig added, as a GLB.
 
     Unlike :func:`build_glb` (the server's GLB: the skinned mesh only), this
@@ -340,20 +340,35 @@ def apply_rig(source, payload, *, name: Optional[str] = None) -> bytes:
     accessors shared) so each use carries its own weights. Primitives the rig
     has no rows for (points, lines, no triangles) take their nearest rigged
     vertex's influences, as glTF needs them on every primitive of a skinned
-    mesh. The model keeps its place (the server's ground offset is not applied).
+    mesh. The model keeps its place unless ``auto_ground`` is true, which applies
+    the server's ground offset (the scene's bottom on Z=0) by translating the
+    scene's root nodes and the armature together; vertex data is unchanged.
 
     ``source`` and ``payload`` as for :func:`build_glb`.
     """
     scene, payload = _load_checked(source, payload, name)
     document = scene.document
     with malformed_as_value_error(document.path.name):
-        return _apply_rig(scene, document, payload.rig)
+        return _apply_rig(scene, document, payload.rig, auto_ground)
 
 
-def _apply_rig(scene, document, rig: SkinnedRig) -> bytes:
+def _translate_node(node: dict, shift: np.ndarray) -> None:
+    """Add ``shift`` to a node's local transform (a world-space shift for a root)."""
+    if 'matrix' in node:
+        matrix = list(node['matrix'])
+        for k in range(3):
+            matrix[12 + k] += float(shift[k])
+        node['matrix'] = matrix
+    else:
+        translation = node.get('translation', [0., 0., 0.])
+        node['translation'] = [float(translation[k]) + float(shift[k]) for k in range(3)]
+
+
+def _apply_rig(scene, document, rig: SkinnedRig, auto_ground: bool = False) -> bytes:
     import copy
 
     from .builder import ARRAY_BUFFER
+    shift = np.asarray(rig.offset, dtype=np.float64) if auto_ground else None
 
     data = copy.deepcopy(document.data)
     writer = _BinWriter(data, _bin_buffer(document, data))
@@ -377,7 +392,20 @@ def _apply_rig(scene, document, rig: SkinnedRig) -> bytes:
     scenes = data.get('scenes')
     if not scenes:
         scenes = data['scenes'] = [{'nodes': []}]
-    scenes[data.get('scene', 0)].setdefault('nodes', []).append(base)
+    scene_nodes = scenes[data.get('scene', 0)].setdefault('nodes', [])
+    if shift is not None and np.any(shift):
+        # Move the whole scene (and the armature with it) by translating its
+        # root nodes. Skinned vertices follow the armature, so the vertex data
+        # and the inverse bind matrices stay as they are.
+        if scene_nodes:
+            moved_roots = list(scene_nodes)
+        else:  # no root list: readers (and ours) take every parentless node
+            children = {c for n in nodes[:base] for c in n.get('children', [])}
+            moved_roots = [i for i in range(base) if i not in children]
+        for i in moved_roots:
+            _translate_node(nodes[i], shift)
+        nodes[base]['translation'] = shift.tolist()
+    scene_nodes.append(base)
     joint_nodes = list(range(base + 1, base + 1 + J))
 
     skins = data.setdefault('skins', [])

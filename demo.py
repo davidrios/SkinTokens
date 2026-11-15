@@ -177,6 +177,7 @@ def run_rig(
     hf_path: Optional[str],
     seed: int,
     num_samples: int = 1,
+    auto_ground: bool = True,
 ):
     """Rig each file with greedy decoding: ``num_samples`` rigs per file, each
     from its own point sampling of the mesh, all reproducible from ``seed``."""
@@ -294,6 +295,7 @@ def run_rig(
                     target_path=asset.path,
                     export_path=str(out_path),
                     group_per_vertex=4,
+                    auto_ground=auto_ground,
                 )
 
             print(f"[OK] Exported: {out_path}")
@@ -333,6 +335,7 @@ def run_cli(args):
         args.hf_path,
         seed=seed,
         num_samples=args.num_samples,
+        auto_ground=args.auto_ground,
     )
 
 
@@ -346,6 +349,10 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=None,
                         help="Seed for the point sampling; the same seed and --num-samples reproduce "
                              "the same outputs (default: random, printed)")
+
+    parser.add_argument("--auto-ground", action=argparse.BooleanOptionalAction, default=True,
+                        help="Move the rigged model so its bottom sits on Z=0 "
+                             "(default: on; --no-auto-ground keeps it in place)")
 
     parser.add_argument("--model_ckpt", default=MODEL_CKPTS[0] if MODEL_CKPTS else "")
     parser.add_argument("--hf_path", default=None)

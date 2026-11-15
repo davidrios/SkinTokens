@@ -164,10 +164,11 @@ def _minimal_glb_for_rig(file_data: bytes) -> bytes:
     return builder.to_bytes()
 
 
-def _rebuilder(file_data: bytes, filename: str):
+def _rebuilder(file_data: bytes, filename: str, auto_ground: bool = True):
     """A function turning a rig payload into ``file_data`` rigged: the input
     file with the skeleton and skin added, its materials, textures and node
-    structure kept.
+    structure kept. With ``auto_ground`` the model is also moved so its bottom
+    sits on Z=0.
 
     The input is parsed once (as the server parsed the upload) for all samples.
     """
@@ -183,7 +184,7 @@ def _rebuilder(file_data: bytes, filename: str):
             "or pass --output-format glb if the server serves GLBs"
         ) from exc
     scene = load_scene(file_data, name="input" + Path(filename).suffix.lower())
-    return lambda payload: apply_rig(scene, payload)
+    return lambda payload: apply_rig(scene, payload, auto_ground=auto_ground)
 
 
 async def _run(args) -> None:
@@ -212,7 +213,7 @@ async def _run(args) -> None:
         "output": args.output_format,
     }
     # Parsed before connecting, so an input that cannot be rigged fails early.
-    rebuild = _rebuilder(file_data, filename) if args.output_format == "rig" else None
+    rebuild = _rebuilder(file_data, filename, args.auto_ground) if args.output_format == "rig" else None
 
     progress = ProgressDisplay()
     started_at = time.monotonic()
@@ -274,7 +275,7 @@ async def _run(args) -> None:
                         if pending_format not in ("rig", "glb"):
                             raise RuntimeError(f"server sent an unknown format {pending_format!r}")
                         if pending_format == "rig" and rebuild is None:
-                            rebuild = _rebuilder(file_data, filename)
+                            rebuild = _rebuilder(file_data, filename, args.auto_ground)
                         progress.update(100, "complete", message.get("elapsed_sec"))
                         progress.finish()
                         if pending_sample_index == 0 and message.get("seed") is not None:
@@ -323,8 +324,14 @@ def main() -> None:
                              "added here to the input file (materials and textures kept); "
                              "'glb', the server's skinned-mesh-only GLB (served only with "
                              "SKINTOKENS_ENABLE_GLB_OUTPUT=1)")
+    parser.add_argument("--auto-ground", action=argparse.BooleanOptionalAction, default=True,
+                        help="Move the rigged model so its bottom sits on Z=0 (default: on; "
+                             "--no-auto-ground keeps the model in place; needs --output-format rig, "
+                             "as the server's GLB is always grounded)")
     parser.add_argument("--timeout", type=int, default=30, help="Connection timeout seconds")
     args = parser.parse_args()
+    if not args.auto_ground and args.output_format == "glb":
+        parser.error("--no-auto-ground needs --output-format rig (the server's GLB is always grounded)")
 
     if args.output is None:
         input_name = os.path.splitext(os.path.basename(args.input))[0]

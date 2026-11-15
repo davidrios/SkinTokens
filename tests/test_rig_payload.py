@@ -382,13 +382,18 @@ def test_rigged_input_skins_like_the_server_glb(tmp_path, case, posed):
     payload = encode_rig_payload(scene, rig)
     server_glb = build_glb(upload, payload, name=name)
     rigged = apply_rig(upload, payload, name=name)
+    grounded = apply_rig(upload, payload, name=name, auto_ground=True)
 
     layout = scene_layout(scene)
-    ours = _skinned_vertices(rigged, lambda data: [
-        (e["node"], [p["index"] for p in e["primitives"]]) for e in layout], posed)
-    # The server's GLB stands on the ground; the rigged input keeps its place.
-    theirs = _skinned_vertices(server_glb, _server_primitives, posed) - rig.offset
-    np.testing.assert_allclose(ours, theirs, atol=1e-5 * max(1.0, float(np.ptp(theirs))))
+    primitives = lambda data: [
+        (e["node"], [p["index"] for p in e["primitives"]]) for e in layout]
+    ours = _skinned_vertices(rigged, primitives, posed)
+    # The server's GLB stands on the ground; the rigged input keeps its place
+    # unless auto_ground moves it there too.
+    server = _skinned_vertices(server_glb, _server_primitives, posed)
+    atol = 1e-5 * max(1.0, float(np.ptp(server)))
+    np.testing.assert_allclose(ours, server - rig.offset, atol=atol)
+    np.testing.assert_allclose(_skinned_vertices(grounded, primitives, posed), server, atol=atol)
 
 
 def test_rigged_input_keeps_everything_the_input_has():
