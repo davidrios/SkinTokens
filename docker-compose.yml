@@ -25,7 +25,7 @@ services:
       # the total is this count times the number of visible GPUs (workers are
       # pinned to the cards round-robin), and up to that many requests run in
       # parallel.
-      SKINTOKENS_WORKERS: ${SKINTOKENS_WORKERS:-2}
+      SKINTOKENS_WORKERS: ${SKINTOKENS_WORKERS:-1}
       SKINTOKENS_MAX_NUM_SAMPLES: ${SKINTOKENS_MAX_NUM_SAMPLES:-1}
       SKINTOKENS_MAX_NEW_TOKENS: 2048
       # Results are rig payloads (skeleton + skin; clients add them to the file
