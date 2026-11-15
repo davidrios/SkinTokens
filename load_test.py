@@ -16,7 +16,13 @@ Usage::
     python load_test.py                          # defaults: --concurrency 1,4 --requests 12,24
     python load_test.py --concurrency 1,2,4 --requests 8
     python load_test.py --label baseline --out baseline.json
+    python load_test.py --save-outputs outputs/glbs
     python load_test.py compare baseline.json after.json
+
+``--save-outputs DIR`` writes each sample's reconstructed GLB (the rig payload
+added to the input file) to ``DIR`` at the end of the run, naming files
+``<input>_seed<seed>_s<sample>.glb``. It only works with ``--output-format rig``
+and needs NumPy, SciPy and this repository's ``src`` package.
 
 ``--requests`` takes one count per concurrency level; a single value applies to
 every level. The draw is seeded (``--draw-seed``), so two runs with the same
@@ -77,14 +83,39 @@ def load_inputs(paths: list[str]) -> dict[str, bytes]:
     return inputs
 
 
+def _rebuild_glb(file_data: bytes, filename: str):
+    """A function turning a rig payload into the rigged GLB bytes: the input
+    file with the skeleton and skin added, its materials, textures and node
+    structure kept. The input is parsed once (as the server parsed the upload)
+    for all samples of one request."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from src.rig_package.glb_io import apply_rig, load_scene
+        # apply_rig imports SciPy lazily, for primitives without rig rows, so
+        # probe it here where the failure can still be explained.
+        import scipy.spatial  # noqa: F401
+    except ImportError as exc:
+        raise SystemExit(
+            f"--save-outputs needs NumPy, SciPy and this repository's src package ({exc})"
+        ) from exc
+    scene = load_scene(file_data, name="input" + Path(filename).suffix.lower())
+    return lambda payload: apply_rig(scene, payload)
+
+
+def _saved_output_path(save_dir: str, name: str, seed: int, sample_index: int) -> Path:
+    path = Path(save_dir)
+    return path / f"{Path(name).stem}_seed{seed}_s{sample_index}.glb"
+
+
 async def one_request(server: str, name: str, data: bytes, seed: int, output: str,
-                      origin: float) -> dict:
+                      origin: float, get_rebuild=None, save_dir: str | None = None) -> dict:
     import websockets
 
     row: dict = {"input": name, "seed": seed, "ok": False}
     started = time.perf_counter()
     row["t_start"] = round(started - origin, 3)
     hasher = hashlib.sha256()
+    frames: list[bytes] = []
     try:
         async with websockets.connect(websocket_url(server),
                                       max_size=None, open_timeout=30,
@@ -99,6 +130,8 @@ async def one_request(server: str, name: str, data: bytes, seed: int, output: st
                     hasher.update(raw)
                     size += len(raw)
                     received += 1
+                    if save_dir is not None:
+                        frames.append(raw)  # kept only to reconstruct GLBs later
                     if received >= expected:
                         row["ok"] = True
                         break
@@ -120,16 +153,41 @@ async def one_request(server: str, name: str, data: bytes, seed: int, output: st
         row["error"] = f"{type(exc).__name__}: {exc}"
     if not row["ok"]:
         row.setdefault("error", "connection closed before a result")
+    # The round trip is over: record the latency before any client-side work,
+    # so reconstructing GLBs below does not inflate the measured latency.
     ended = time.perf_counter()
     row["t_end"] = round(ended - origin, 3)
     row["latency"] = round(ended - started, 3)
     if row["ok"] and "wait_sec" in row:
         row["gpu_sec"] = round(row["latency"] - row["wait_sec"], 3)
+    if row["ok"] and get_rebuild is not None and save_dir is not None:
+        # Reconstruct each sample's GLB from the rig payload the server sent.
+        # The rebuild is built from this request's own input file (cached per
+        # input). It runs off the event loop so it does not stall the other
+        # in-flight requests, and after the latency above so it does not count
+        # toward the load-test metrics.
+        def _save() -> list[str]:
+            rebuild = get_rebuild(name)
+            Path(save_dir).mkdir(parents=True, exist_ok=True)
+            saved: list[str] = []
+            for idx, frame in enumerate(frames):
+                path = _saved_output_path(save_dir, name, seed, idx)
+                path.write_bytes(rebuild(frame))
+                saved.append(str(path))
+            return saved
+        try:
+            saved = await asyncio.to_thread(_save)
+            row["num_samples"] = len(frames)
+            row["output_paths"] = saved
+        except Exception as exc:
+            # A save failure does not mean the server round trip failed.
+            row["save_error"] = f"{type(exc).__name__}: {exc}"
     return row
 
 
 async def run_level(server: str, inputs: dict[str, bytes], concurrency: int, count: int,
-                    rng: random.Random, base_seed: int, output: str) -> list[dict]:
+                    rng: random.Random, base_seed: int, output: str,
+                    get_rebuild=None, save_dir: str | None = None) -> list[dict]:
     names = list(inputs)
     queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
     for index in range(count):
@@ -143,7 +201,8 @@ async def run_level(server: str, inputs: dict[str, bytes], concurrency: int, cou
                 name, seed = queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
-            rows.append(await one_request(server, name, inputs[name], seed, output, origin))
+            rows.append(await one_request(server, name, inputs[name], seed, output, origin,
+                                          get_rebuild=get_rebuild, save_dir=save_dir))
 
     await asyncio.gather(*(worker() for _ in range(concurrency)))
     return rows
@@ -207,6 +266,20 @@ async def cmd_run(args) -> int:
     report = {"label": args.label, "server": args.server, "output": args.output_format,
               "health": health, "runs": []}
     prefix = f"{args.label} " if args.label else ""
+    get_rebuild = None
+    save_dir = args.save_outputs
+    if save_dir is not None:
+        if args.output_format != "rig":
+            raise SystemExit("--save-outputs only supports --output-format rig")
+        rebuild_cache: dict[str, object] = {}
+
+        def get_rebuild(name: str):
+            # One rebuild per input file: the scene is parsed once per input and
+            # reused for every sample and every request of that input.
+            if name not in rebuild_cache:
+                rebuild_cache[name] = _rebuild_glb(inputs[name], name)
+            return rebuild_cache[name]
+
     failed = False
     if args.warmup:
         name, data = next(iter(inputs.items()))
@@ -217,7 +290,7 @@ async def cmd_run(args) -> int:
         print(f"[load] warmup {name}: {row['latency']:.2f}s {status}", flush=True)
     for concurrency, count in levels:
         rows = await run_level(args.server, inputs, concurrency, count, rng, args.seed,
-                               args.output_format)
+                               args.output_format, get_rebuild=get_rebuild, save_dir=save_dir)
         summary = summarize(rows)
         failed |= summary["errors"] > 0
         report["runs"].append({"concurrency": concurrency, "summary": summary, "requests": rows})
@@ -288,6 +361,10 @@ def main() -> int:
     run.add_argument("--label", help="Name stored in the report and shown in progress lines")
     run.add_argument("--out", help="Save the JSON report here (console only if omitted)")
     run.add_argument("--no-warmup", dest="warmup", action="store_false")
+    run.add_argument("--save-outputs", default=None,
+                     help="Directory to write each sample's reconstructed GLB to "
+                          "(needs --output-format rig, plus NumPy, SciPy and this "
+                          "repository's src package)")
     compare = sub.add_parser("compare", help="Compare saved reports side by side")
     compare.add_argument("reports", nargs="+")
     argv = sys.argv[1:]
