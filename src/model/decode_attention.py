@@ -73,12 +73,16 @@ def decode_attention_math(query, key, value, attention_mask, scaling):
     b, hq, _, d = query.shape
     hkv = key.shape[1]
     rep = hq // hkv
-    q = query.reshape(b, hkv, rep, d).float()
-    scores = torch.einsum("bhrd,bhsd->bhrs", q, key.float()) * scaling
-    valid = _valid_slots(attention_mask)[:, None, None, :]
-    scores = scores.masked_fill(~valid, float("-inf"))
-    probs = torch.softmax(scores, dim=-1)
-    out = torch.einsum("bhrs,bhsd->bhrd", probs, value.float())
+    # The decode loop runs under bf16 autocast. Explicit .float() alone does
+    # not protect einsum: autocast downcasts its operands again, rounding both
+    # the attention scores and the weighted sum before the final output cast.
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        q = query.reshape(b, hkv, rep, d).float()
+        scores = torch.einsum("bhrd,bhsd->bhrs", q, key.float()) * scaling
+        valid = _valid_slots(attention_mask)[:, None, None, :]
+        scores = scores.masked_fill(~valid, float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        out = torch.einsum("bhrs,bhsd->bhrd", probs, value.float())
     return out.reshape(b, hq, 1, d).to(query.dtype)
 
 

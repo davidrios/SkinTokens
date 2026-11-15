@@ -91,7 +91,7 @@ class Finished:
 class _Snapshot:
     host: Tensor
     event: Any
-    rows: Dict[int, Any] = field(default_factory=dict)  # slot -> row key at request time
+    rows: Dict[int, _Row] = field(default_factory=dict)  # slot -> row identity at request time
     step: int = 0
 
 
@@ -114,6 +114,8 @@ class BatchDecoder:
         self.buckets = tuple(b for b in BUCKETS if b <= slots)
         self.max_new_tokens = int(max_new_tokens)
         self.prompt_length = int(prompt_length)
+        if self.max_new_tokens < 1 or self.prompt_length < 1:
+            raise ValueError("max_new_tokens and prompt_length must be positive")
         self.length = self.prompt_length + self.max_new_tokens  # cache slots per row
         self.eos = int(model.eos)
         self.device = model.device
@@ -197,7 +199,11 @@ class BatchDecoder:
 
         if not self.free:
             raise RuntimeError("no free slot")
+        if any(row.key == key for row in self._rows):
+            raise ValueError(f"row key is already active: {key!r}")
         length = inputs_embeds.shape[0]
+        if length < 1:
+            raise ValueError("prompt must have a positive number of positions")
         if length > self.prompt_length:
             raise ValueError(f"prompt of {length} positions; the cache holds {self.prompt_length}")
         slot = len(self._rows)
@@ -387,7 +393,7 @@ class BatchDecoder:
         host.copy_(self._status, non_blocking=True)
         event = torch.cuda.Event()
         event.record()
-        self._snapshot = _Snapshot(host, event, {r.slot: r.key for r in self._rows}, self._steps)
+        self._snapshot = _Snapshot(host, event, {r.slot: r for r in self._rows}, self._steps)
 
     def _read_status(self, wait: bool) -> List[Finished]:
         snapshot = self._snapshot
@@ -403,15 +409,14 @@ class BatchDecoder:
         self._snapshot = None
         finished = []
         by_key = {row.key: row for row in self._rows}
-        for slot, key in snapshot.rows.items():
-            row = by_key.get(key)
-            if row is None:
-                continue  # removed since
+        for slot, row in snapshot.rows.items():
+            if by_key.get(row.key) is not row:
+                continue  # removed or replaced since; a key can be reused
             row.status = [values[i][slot] for i in range(5)]
             if row.status[_DONE]:
                 count = row.status[_GENERATED]
                 ids = self._out[row.slot, :count].to("cpu")
-                finished.append(Finished(key, ids))
+                finished.append(Finished(row.key, ids))
         for item in finished:
             self._free(by_key[item.key])
         if self._rows:

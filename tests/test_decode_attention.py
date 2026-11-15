@@ -59,6 +59,26 @@ def test_math_accepts_additive_float_mask():
     torch.testing.assert_close(out, reference(query, key, value, valid, scale), atol=1e-5, rtol=1e-4)
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_math_preserves_float32_accumulation_under_autocast(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    # pipeline.py enables TF32 globally; isolate the autocast regression
+    # from shape-dependent TF32 rounding in the independent reference.
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        query, key, value, mask, valid, scale = make_case(
+            device, torch.float32, s=257, filled=(1, 200))
+        expected = reference(query, key, value, valid, scale)
+        with torch.autocast(device, dtype=torch.bfloat16):
+            out = da.decode_attention_math(query, key, value, mask, scale)
+        assert out.dtype == query.dtype
+        torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-4)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+
 needs_triton = pytest.mark.skipif(not da._has_triton(), reason="needs CUDA and Triton")
 
 
