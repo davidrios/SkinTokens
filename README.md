@@ -124,14 +124,12 @@ Inputs may be `.glb` or `.gltf` (with embedded or adjacent resources); any exist
 
 ### Docker (NVIDIA GPU)
 
-The Compose setup follows the same external-model-volume pattern as TRELLIS.2.
-Project source is mounted at `/workspace/SkinTokens`, while checkpoints are read
-from the external `models` volume at `/models/SkinTokens/experiments`.
+The image is self-contained: the `Dockerfile` copies the project source and the
+model checkpoints (`experiments/`, `models/`) into the image at build time, so
+there is nothing to download or copy before starting. Only the outputs and logs
+live on an external Docker volume.
 
 ```powershell
-# Copy local experiments/ checkpoints into the shared Docker volume (once)
-.\scripts\copy_weights_to_volume.ps1
-
 # Build and start the service
 docker compose build
 docker compose up -d
@@ -169,11 +167,9 @@ and exported in parallel; further requests queue in FIFO order and receive
 `queue_ahead` heartbeats. Each worker needs roughly 2-4 GB of VRAM. Measure concurrent throughput with:
 
 ```powershell
-python scripts/load_test.py --server http://127.0.0.1:8087 -c 4 --json after.json
-python scripts/load_test.py --compare before.json after.json
+python load_test.py run --server http://127.0.0.1:8087 --concurrency 4 --requests 12 --out after.json
+python load_test.py compare before.json after.json
 ```
-
-Each load-test run is capped at 120 seconds.
 
 With fast decode on (the default) each decode step replays a CUDA graph, and
 these switches control the rest of the step (defaults shown; set them to
