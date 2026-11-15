@@ -51,9 +51,10 @@ STARTUP_HEARTBEAT_SEC = max(1.0, float(os.environ.get("SKINTOKENS_STARTUP_HEARTB
 SUPPORTED_EXT = {".glb", ".gltf"}
 
 # GPU worker processes per visible GPU, each with its own copy of the model;
-# the pool starts this many on every GPU (pinned round-robin), so up to
-# WORKERS_PER_GPU * (visible GPUs) requests are sampled on the GPUs at once.
-WORKERS_PER_GPU = env_int("SKINTOKENS_WORKERS", 2, 1, 32)
+# the pool starts this many on every GPU (pinned round-robin). Each runs up to
+# BATCH_SLOTS requests at once, so one per GPU is best: two workers on one GPU
+# take turns on it, and split the requests that would otherwise share a batch.
+WORKERS_PER_GPU = env_int("SKINTOKENS_WORKERS", 1, 1, 32)
 # CPU worker processes (no model, no GPU) that parse uploads and export
 # results, beside the GPU workers' inference (0 = twice the GPU workers, so
 # one request's parse and another's export can both overlap each inference).
@@ -63,6 +64,25 @@ CPU_WORKERS = env_int("SKINTOKENS_CPU_WORKERS", 0, 0, 256)
 WORKER_CPU_THREADS = env_int("SKINTOKENS_WORKER_CPU_THREADS", 0, 0, 256)
 
 MAX_NUM_SAMPLES = env_int("SKINTOKENS_MAX_NUM_SAMPLES", 1, 1, 8)
+
+
+def _batch_slots() -> int:
+    """SKINTOKENS_BATCH_SLOTS: rows each GPU worker decodes at once (1, 2 or
+    4), or 0 for no batching."""
+    value = env_int("SKINTOKENS_BATCH_SLOTS", 4, 0, 4)
+    if value == 3:
+        logger.warning("SKINTOKENS_BATCH_SLOTS=3 is not a supported batch size; using 2")
+        value = 2
+    return value
+
+
+# Continuous batching (src/model/batch_decode.py): each GPU worker decodes up
+# to this many point clouds at once, requests joining and leaving between
+# decode steps, and accepts as many requests at a time. 1, 2 or 4; larger
+# batches gain nothing more (decoding becomes compute bound). Needs fast
+# decode on CUDA; otherwise, or with 0, a worker runs one request at a time
+# (transformers' generate, as before continuous batching).
+BATCH_SLOTS = _batch_slots()
 # Result formats a request may ask for (GenParams.output). "rig" sends only the
 # skeleton and skin, which the client adds to the file it uploaded
 # (src/rig_package/glb_io/rig_payload.py); the whole GLB is several times
@@ -86,7 +106,6 @@ UPLOAD_TIMEOUT_SEC = env_int("SKINTOKENS_UPLOAD_TIMEOUT_SEC", 300, 1, 3600)
 # to about (total workers + MAX_QUEUE) * MAX_UPLOAD_MB; further requests are
 # refused.
 MAX_QUEUE = env_int("SKINTOKENS_MAX_QUEUE", 16, 0, 10000)
-USE_GENERATION_CACHE = env_flag("SKINTOKENS_USE_CACHE", True)
 EMPTY_CACHE_AFTER_INFERENCE = env_flag("SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE", True)
 # Fast decode: SDPA attention + static KV cache + CUDA-graph capture gives ~2x
 # on the autoregressive decoding stage, which dominates wall time.

@@ -164,17 +164,45 @@ processes: a CPU worker parses the upload and samples its point clouds, a GPU
 worker samples the rig, and a CPU worker exports the result. The CPU and GPU
 stages of different requests overlap: while one request is on the GPU, the
 next is parsed and the previous one exported. Each GPU worker has its own copy
-of the model and runs one inference at a time; `SKINTOKENS_WORKERS`
-(default 2) sets the number of GPU workers **on each visible GPU** (pinned
-round-robin). `SKINTOKENS_CPU_WORKERS` (default 0 = twice the GPU workers) sets
-the number of CPU workers, which load no model and see no GPU. A request
-waiting for a stage queues in FIFO order (exports ahead of new parses) and
-receives `queue_ahead` heartbeats. Each GPU worker needs roughly 2-4 GB of VRAM. Measure concurrent throughput with:
+of the model; `SKINTOKENS_WORKERS` (default 1) sets the number of GPU workers
+**on each visible GPU** (pinned round-robin). `SKINTOKENS_CPU_WORKERS`
+(default 0 = twice the GPU workers) sets the number of CPU workers, which load
+no model and see no GPU. A request waiting for a stage queues in FIFO order
+(exports ahead of new parses) and receives `queue_ahead` heartbeats. Each GPU
+worker needs roughly 2-4 GB of VRAM, plus its batch's KV cache (about 280 MB
+per slot). Measure concurrent throughput with:
 
 ```powershell
 python load_test.py run --server http://127.0.0.1:8087 --concurrency 4 --requests 12 --out after.json
 python load_test.py compare before.json after.json
 ```
+
+A GPU worker batches its requests continuously
+(`src/model/batch_decode.py`). It takes up to `SKINTOKENS_BATCH_SLOTS`
+(default 4; 1, 2 or 4) requests at once and decodes their point clouds
+together, one per slot. A request joins as soon as a slot frees and leaves
+when its rig ends, without waiting for the others. A decode step over four
+rows costs little more than a step over one, so a single worker serves
+several requests in about the time of one; larger batches gain nothing more.
+Each batch size's decode step is captured once as a CUDA graph.
+`SKINTOKENS_BATCH_SLOTS=0`, or fast decode off, or a CPU device, serves one
+request at a time through `transformers`' `generate`, as before.
+
+More than one worker per GPU does not help with batching: the workers take
+turns on the GPU and split the requests that would otherwise share a batch.
+
+With `SKINTOKENS_FAST_DECODE_BACKEND=inductor` (the Compose default), the
+step is compiled before it is captured: startup takes longer, but each step
+is substantially faster than the unfused path.
+
+> [!NOTE]
+> Results are not exactly reproducible under batching. Decoding is greedy,
+> and the kernels that compute a row depend on how many other rows decode
+> beside it, so a near-tie between two tokens (in practice, two adjacent
+> coordinate bins) can go either way and the same input and `seed` may give
+> a slightly different rig depending on the server's load.
+> `SKINTOKENS_DETERMINISTIC` does not remove this. Without batching
+> (`SKINTOKENS_BATCH_SLOTS=0`), a seed reproduces as before.
 
 With fast decode on (the default) each decode step replays a CUDA graph, and
 these switches control the rest of the step (defaults shown; set them to
@@ -186,10 +214,9 @@ compare or to fall back):
 | `SKINTOKENS_GPU_GRAMMAR` | `1` | Enforce the rig-token grammar with GPU state tensors instead of copying the sequence to the CPU every token. |
 | `SKINTOKENS_GRAMMAR_COMPILE` | `1` with CUDA + Triton | Fuse the grammar step (state update and logit mask) into one compiled function. |
 | `SKINTOKENS_DEFERRED_STOP` | `1` | Check for the end of generation one step late on CUDA, so the host never waits for the GPU between tokens. |
-| `SKINTOKENS_DETERMINISTIC` | `0` | Set to `1` for deterministic kernels, so a seed reproduces the same rig on every worker and across restarts. Off, decoding is about a third faster (2.1 vs 3.3 ms/token at batch 1), but a seed then reproduces only within one worker process. |
+| `SKINTOKENS_DETERMINISTIC` | `0` | Set to `1` for deterministic kernels. Without batching (`SKINTOKENS_BATCH_SLOTS=0`), a seed then reproduces the same rig on every worker and across restarts. With batching, results still depend on the other rows in the batch (see the note above). Off, decoding is about a third faster (2.1 vs 3.3 ms/token at batch 1), but a seed then reproduces only within one worker process. |
 
-For lower peak VRAM at the cost of much slower autoregressive decoding, set
-`SKINTOKENS_USE_CACHE=0`. `/dev/shm` can be adjusted with
+`/dev/shm` can be adjusted with
 `SKINTOKENS_SHM_SIZE`; the Compose default is `1gb` because inference uses
 single-worker dataloading.
 

@@ -87,9 +87,6 @@ def get_model(
 
     model = model.to(device)
     if hasattr(model.transformer, "config") and hasattr(model.transformer.config, "use_cache"):
-        raw_use_cache = os.environ.get("SKINTOKENS_USE_CACHE", "1")
-        model.transformer.config.use_cache = raw_use_cache.strip().lower() in {
-            "1", "true", "yes", "on"
-        }
+        model.transformer.config.use_cache = True
     model.eval()
     return model

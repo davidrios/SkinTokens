@@ -422,10 +422,11 @@ def test_ws_refuses_requests_beyond_the_queue_limit(monkeypatch):
     monkeypatch.setattr(serve.config, "WORKERS_PER_GPU", 1)
     monkeypatch.setattr(serve.config, "CPU_WORKERS", 2)
     monkeypatch.setattr(serve.config, "MAX_QUEUE", 2)
+    monkeypatch.setattr(serve.config, "BATCH_SLOTS", 4)
     monkeypatch.setattr(serve, "visible_gpu_count", lambda: 1)
-    # 1 GPU worker + 2 CPU workers + 2 queued.
-    serve.state.admitted = 5
+    # 1 GPU worker with 4 slots + 2 CPU workers + 2 queued.
+    serve.state.admitted = 8
     ws = _FakeWs('{"filename": "a.glb"}', b"upload")
     assert "server busy" in _run_ws(ws)
     assert ws.incoming == [b"upload"]  # refused before receiving the upload
-    assert serve.state.admitted == 5
+    assert serve.state.admitted == 8

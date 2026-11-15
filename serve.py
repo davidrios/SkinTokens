@@ -10,10 +10,11 @@ overlap:
 2. ``infer`` on a GPU worker: sample the rig, interpolate its skin.
 3. ``export`` on a CPU worker: build the rig payload or GLB.
 
-Each GPU worker has its own copy of the model resident in VRAM and runs one
-request's inference at a time; the GPU pool runs ``SKINTOKENS_WORKERS``
-workers **on each** visible GPU (pinned round-robin, each worker sees its card
-as ``cuda:0``). The CPU workers (``SKINTOKENS_CPU_WORKERS``) load no model and
+Each GPU worker has its own copy of the model resident in VRAM and runs up
+to ``SKINTOKENS_BATCH_SLOTS`` (1, 2 or 4) requests' inference at once, decoding
+their point clouds together with continuous batching (``src/server/pipeline.py``);
+the GPU pool runs ``SKINTOKENS_WORKERS`` workers **on each** visible GPU
+(pinned round-robin, each worker sees its card as ``cuda:0``). The CPU workers (``SKINTOKENS_CPU_WORKERS``) load no model and
 see no GPU (``src/server/stages.py``). So with one GPU worker, the next
 request is parsed while the current one is on the GPU, and the previous one
 is exported meanwhile. A request waits for each stage's free worker in FIFO
@@ -23,16 +24,18 @@ heartbeat meanwhile.
 Clients submit a 3D file (GLB/GLTF) and receive, over WebSocket, a rig payload
 (skeleton and skin only; the client adds it to the file it uploaded, see
 ``src/rig_package/glb_io/rig_payload.py``) or, if enabled, the whole rigged
-GLB. See ``src/server/pipeline.py`` for the model side (and a note on why
-results are non-deterministic).
+GLB. See ``src/server/pipeline.py`` for the model side (and a note on how far
+results are reproducible).
 
 Run:
     python serve.py --host 0.0.0.0 --port 8087
 
 Environment variables:
-    SKINTOKENS_WORKERS        GPU worker processes per GPU / parallel inferences
-                              per GPU (default 2); total GPU workers = this
-                              times the number of visible GPUs
+    SKINTOKENS_WORKERS        GPU worker processes per GPU (default 1); total
+                              GPU workers = this times the number of visible GPUs
+    SKINTOKENS_BATCH_SLOTS    Requests (point clouds) each GPU worker decodes at
+                              once: 1, 2 or 4 (default 4), 0 for no batching;
+                              needs fast decode on CUDA
     SKINTOKENS_CPU_WORKERS    CPU worker processes for parsing and export
                               (default 0 = twice the GPU workers)
     SKINTOKENS_MODEL_CKPT     Path to the model checkpoint
@@ -191,9 +194,20 @@ def _gpu_workers() -> int:
     return config.WORKERS_PER_GPU * visible_gpu_count()
 
 
+def _gpu_slots() -> int:
+    """Requests the GPU workers run at once: their reported slots once the
+    pool is up, else what the configuration asks for."""
+    status = getattr(state.pool, "status", None)
+    if status is not None:
+        slots = status().get("slots")
+        if slots:
+            return slots
+    return _gpu_workers() * max(1, config.BATCH_SLOTS)
+
+
 def _admission_limit() -> int:
     gpu_workers = _gpu_workers()
-    return gpu_workers + config.cpu_workers(gpu_workers) + config.MAX_QUEUE
+    return _gpu_slots() + config.cpu_workers(gpu_workers) + config.MAX_QUEUE
 
 
 def _client_error_message(exc: BaseException, request_id: str) -> str:
@@ -356,7 +370,7 @@ def _cpu_threads() -> int:
 
 def _worker_options() -> dict:
     return {"model_ckpt": config.MODEL_CKPT, "hf_path": config.HF_PATH,
-            "cpu_threads": _cpu_threads()}
+            "cpu_threads": _cpu_threads(), "batch_slots": config.BATCH_SLOTS}
 
 
 @asynccontextmanager
@@ -756,8 +770,11 @@ def main():
     parser.add_argument("--model-ckpt", default=config.MODEL_CKPT)
     parser.add_argument("--hf-path", default=config.HF_PATH)
     parser.add_argument("--workers", type=int, default=config.WORKERS_PER_GPU,
-                        help="GPU worker processes per GPU (parallel inferences per "
-                             "GPU); SKINTOKENS_WORKERS")
+                        help="GPU worker processes per GPU; SKINTOKENS_WORKERS")
+    parser.add_argument("--batch-slots", type=int, default=config.BATCH_SLOTS,
+                        choices=(0, 1, 2, 4),
+                        help="requests each GPU worker decodes at once (0: no "
+                             "batching); SKINTOKENS_BATCH_SLOTS")
     parser.add_argument("--cpu-workers", type=int, default=config.CPU_WORKERS,
                         help="CPU worker processes for parsing and export "
                              "(0 = twice the GPU workers); SKINTOKENS_CPU_WORKERS")
@@ -771,6 +788,7 @@ def main():
     config.HF_PATH = args.hf_path
     config.WORKERS_PER_GPU = args.workers
     config.CPU_WORKERS = args.cpu_workers
+    config.BATCH_SLOTS = args.batch_slots
 
     import uvicorn
 

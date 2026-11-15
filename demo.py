@@ -196,7 +196,7 @@ def run_rig(
 
     generate_kwargs = dict(
         max_new_tokens=server_config.MAX_NEW_TOKENS,
-        use_cache=server_config.USE_GENERATION_CACHE,
+        use_cache=True,
     )
     fast_decode = server_config.FAST_DECODE and torch.device(model.device).type == "cuda"
     if fast_decode:

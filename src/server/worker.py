@@ -1,4 +1,4 @@
-"""Worker process: owns one copy of the model and runs one request at a time.
+"""Worker process: owns one copy of the model and runs its requests.
 
 Started by :class:`src.server.pool.WorkerPool` with the ``spawn`` method (CUDA
 cannot be used across a fork). It talks to the gateway over two one-way pipes:
@@ -13,6 +13,11 @@ worker → gateway
 Jobs run on the process's main thread (the thread that loaded the model and
 captured any CUDA graphs); a reader thread takes messages off the jobs pipe so
 that a ``cancel`` reaches the running job while it works.
+
+A worker runs one job at a time, unless its spec has a ``serve`` loop and its
+``load`` reported ``slots`` (> 0) in its info: the gateway then sends it up to
+that many jobs at once, and ``serve`` runs them together (continuous batching,
+:mod:`src.server.pipeline`), taking jobs from a :class:`JobSource`.
 
 This module stays free of model imports: only the spec a worker runs decides
 what it loads, so tests can run workers with a fixture spec and no model.
@@ -69,11 +74,16 @@ class ServiceSpec:
     ``run(params, upload, cancellation, progress)`` serves one request.
     ``idle()`` (optional) runs in the worker after each request's reply has
     been sent, for housekeeping that must not delay that reply.
+    ``serve(source)`` (optional) replaces the one-job-at-a-time loop when
+    ``load`` reports ``slots`` in its info: it runs until
+    :meth:`JobSource.next` raises :class:`Stopped`, taking jobs and answering
+    each through its :class:`Job`.
     """
     name: str
     load: Callable[[dict], dict]
     run: Callable[[dict, bytes, Cancellation, ProgressCallback], Any]
     idle: Optional[Callable[[], None]] = None
+    serve: Optional[Callable[["JobSource"], None]] = None
 
 
 class _Sender:
@@ -148,12 +158,84 @@ class _Inbox:
             pass  # The gateway is gone.
         self._jobs.put(self.STOP)
 
-    def next(self):
-        return self._jobs.get()
+    def next(self, block: bool = True):
+        """The next ``(message, token)`` or :attr:`STOP`; None if *block* is
+        false and nothing is waiting."""
+        if block:
+            return self._jobs.get()
+        try:
+            return self._jobs.get_nowait()
+        except queue.Empty:
+            return None
 
     def done(self, job_id: int) -> None:
         with self._lock:
             self._tokens.pop(job_id, None)
+
+
+class Stopped(Exception):
+    """The gateway stopped the worker (or is gone): ``serve`` should return."""
+
+
+class Job:
+    """One job as a ``serve`` loop holds it; answered once, by :meth:`reply`
+    or :meth:`fail`."""
+
+    def __init__(self, source: "JobSource", job_id: int, params: dict, upload: Any,
+                 cancellation: Cancellation) -> None:
+        self._source = source
+        self.id = job_id
+        self.params = params
+        self.upload = upload
+        self.cancellation = cancellation
+        self.answered = False
+
+    def progress(self, event: dict) -> None:
+        self._source._sender.send(("progress", self.id, event))
+
+    def reply(self, value: Any) -> None:
+        self._answer(("result", self.id, value))
+
+    def fail(self, exc: BaseException) -> None:
+        self._answer(("error", self.id, pack_exception(exc)))
+
+    def _answer(self, reply: tuple) -> None:
+        if self.answered:
+            return
+        self.answered = True
+        self.upload = None
+        self._source._inbox.done(self.id)
+        _send_reply(self._source._sender, reply)
+
+
+class JobSource:
+    """Where a ``serve`` loop takes its jobs from."""
+
+    def __init__(self, inbox: _Inbox, sender: _Sender) -> None:
+        self._inbox = inbox
+        self._sender = sender
+
+    def next(self, block: bool) -> Optional[Job]:
+        """The next job; None if *block* is false and none is waiting.
+        Raises :class:`Stopped` once the gateway has stopped the worker."""
+        item = self._inbox.next(block)
+        if item is None:
+            return None
+        if item is _Inbox.STOP:
+            raise Stopped()
+        (_, job_id, params, upload), cancellation = item
+        return Job(self, job_id, params, upload, cancellation)
+
+
+def _send_reply(sender: _Sender, reply: tuple) -> bool:
+    """Send a job's reply; False if the gateway is gone."""
+    try:
+        sender.send(reply)
+    except (EOFError, OSError):
+        return False
+    except Exception as exc:  # A result that cannot be pickled.
+        sender.send(("error", reply[1], pack_exception(exc)))
+    return True
 
 
 def _pin_worker_gpu(gpu) -> None:
@@ -195,9 +277,18 @@ def main(spec_reference: str, jobs, events, options: dict, gpu=None) -> None:
         log.exception("worker failed to load")
         sender.send(("failed", traceback.format_exc()))
         return
+    batched = spec.serve is not None and bool(info.get("slots"))
+    if not batched:
+        info.pop("slots", None)  # the gateway sends one job at a time
     sender.send(("ready", {**info, "pid": os.getpid()}))
 
     inbox = _Inbox(jobs)
+    if batched:
+        try:
+            spec.serve(JobSource(inbox, sender))
+        except Stopped:
+            pass
+        return
     while True:
         item = inbox.next()
         if item is _Inbox.STOP:
@@ -214,12 +305,8 @@ def main(spec_reference: str, jobs, events, options: dict, gpu=None) -> None:
         finally:
             inbox.done(job_id)
         del upload
-        try:
-            sender.send(reply)
-        except (EOFError, OSError):
+        if not _send_reply(sender, reply):
             return
-        except Exception as exc:  # A result that cannot be pickled.
-            sender.send(("error", job_id, pack_exception(exc)))
         if spec.idle is not None:
             try:
                 spec.idle()

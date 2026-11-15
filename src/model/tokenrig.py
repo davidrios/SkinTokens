@@ -413,37 +413,15 @@ class TokenRig(ModelSpec):
         assert vertices.dim() == 3 and normals.shape == vertices.shape, 'expected (S, N, 3) point clouds'
         num_samples = vertices.shape[0]
 
-        if isinstance(skeleton_tokens, np.ndarray):
-            skeleton_tokens = torch.from_numpy(skeleton_tokens).to(self.device)
-
-        cond = torch.cat([vertices, normals], dim=-1)  # (S, N, 6)
-        # A fixed seed for the VAE's own point subsample: the clouds are already
-        # randomly sampled (and shuffled), so this only removes a second,
-        # unseeded source of run-to-run variation.
-        _, cond_latents = self.vae.model._encode(
-            x=None,
-            cond=cond,
-            num_tokens=self.tokens_per_skin,
-            cond_tokens=self.tokens_skin_cond,
-            return_z=False,
-            seed=0,
-        )
-        assert cond_latents is not None
-
-        learned_mesh_cond = encode_mesh_cond(self.mesh_encoder, self.output_proj, self.tokens_skin_cond, {'vertices': vertices, 'normals': normals})
-
+        cond, cond_latents, learned_mesh_cond = self.encode_condition(vertices, normals)
         device = cond.device
-        start_tokens_list = self.make_start_tokens(
-            device=device,
-            cls=None if cls is None else [cls],
-            skeleton_tokens=None if skeleton_tokens is None else [skeleton_tokens],
-            num_joints=None if num_joints is None else [num_joints],
-            parents=None if parents is None else [parents],
-        )
-        start_tokens = torch.tensor(start_tokens_list, device=device)  # (1, seq_len)
+        start_tokens = torch.tensor(
+            [self.prompt_tokens(cls=cls, skeleton_tokens=skeleton_tokens,
+                                num_joints=num_joints, parents=parents)],
+            device=device)  # (1, seq_len)
         if num_samples > 1:
             start_tokens = start_tokens.repeat(num_samples, 1)  # (num_samples, seq_len)
-        
+
         start_embed = self.transformer.get_input_embeddings()(start_tokens)
         inputs_embeds = torch.cat([learned_mesh_cond, start_embed], dim=1)
         
@@ -489,40 +467,137 @@ class TokenRig(ModelSpec):
         if progress_callback is not None:
             progress_callback(74, f"preparing for export...")
 
-        outputs: List[TokenRigResult] = []
-        for i in range(num_samples):
-            output_ids = results[i]
-            for token in reversed(start_tokens[i]):
-                v = token.item()
-                output_ids = pad(output_ids, (1, 0), value=v)
-            
-            res = TokenRigResult()
-            res.input_ids = start_tokens[i]
-            res.output_ids = output_ids
-            if only_ids:
-                outputs.append(res)
-                continue
-            
-            res.cond = cond[i]
-            res.cond_latents = cond_latents[i]
-            if return_decode_dict:
-                outputs.append(res)
-                continue
-            
-            d = decode(
-                cond=cond[i],
-                cond_latents=cond_latents[i],
-                inputs_ids=output_ids,
-                tokenizer=self.tokenizer,
-                tokens_per_skin=self.tokens_per_skin,
-                vae=self.vae,
-                encode_repeat=DECODE_JOINT_BATCH,
-                progress_callback=progress_callback,
+        return [
+            self.result_from_ids(start_tokens[i], results[i], cond[i], cond_latents[i],
+                                 only_ids=only_ids, return_decode_dict=return_decode_dict,
+                                 progress_callback=progress_callback)
+            for i in range(num_samples)
+        ]
+
+    # The pieces of :meth:`generate`, also used by the continuous-batching
+    # decoder (src/model/batch_decode.py), which runs the token loop itself.
+
+    def encode_condition(self, vertices: Tensor, normals: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        """``(S, N, 3)`` point clouds → ``(cond, cond_latents, mesh_cond)``: the
+        skin VAE's condition and latents, and the LLM's mesh-condition embeddings
+        ``(S, L, hidden)``. Run under bf16 autocast, as :meth:`generate` does."""
+        cond = torch.cat([vertices, normals], dim=-1)  # (S, N, 6)
+        # A fixed seed for the VAE's own point subsample: the clouds are already
+        # randomly sampled (and shuffled), so this only removes a second,
+        # unseeded source of run-to-run variation.
+        _, cond_latents = self.vae.model._encode(
+            x=None,
+            cond=cond,
+            num_tokens=self.tokens_per_skin,
+            cond_tokens=self.tokens_skin_cond,
+            return_z=False,
+            seed=0,
+        )
+        assert cond_latents is not None
+        learned_mesh_cond = encode_mesh_cond(self.mesh_encoder, self.output_proj, self.tokens_skin_cond, {'vertices': vertices, 'normals': normals})
+        return cond, cond_latents, learned_mesh_cond
+
+    def prompt_tokens(self, cls: str|None=None, skeleton_tokens=None, num_joints=None,
+                      parents=None) -> List[int]:
+        """The token prompt one point cloud is decoded from (``[bos, cls]`` for a plain mesh)."""
+        if isinstance(skeleton_tokens, np.ndarray):
+            skeleton_tokens = torch.from_numpy(skeleton_tokens).to(self.device)
+        return self.make_start_tokens(
+            cls=None if cls is None else [cls],
+            skeleton_tokens=None if skeleton_tokens is None else [skeleton_tokens],
+            num_joints=None if num_joints is None else [num_joints],
+            parents=None if parents is None else [parents],
+        )[0]
+
+    @torch.inference_mode()
+    @torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+    def prepare_prompts(self, vertices: Tensor, normals: Tensor, cls: str|None=None) -> List[Dict]:
+        """One decoding prompt per ``(S, N, 3)`` point cloud of a plain mesh:
+        ``inputs_embeds`` ``(L, hidden)`` (mesh condition, then ``[bos, cls]``),
+        ``start_tokens``, and the ``cond``/``cond_latents`` its skin decodes from."""
+        if vertices.dim() == 2:
+            vertices, normals = vertices.unsqueeze(0), normals.unsqueeze(0)
+        cond, cond_latents, mesh_cond = self.encode_condition(vertices, normals)
+        start_tokens = self.prompt_tokens(cls=cls)
+        start_embed = self.transformer.get_input_embeddings()(
+            torch.tensor([start_tokens], device=cond.device))
+        return [
+            {"inputs_embeds": torch.cat([mesh_cond[i:i + 1], start_embed], dim=1)[0],
+             "start_tokens": start_tokens, "cond": cond[i], "cond_latents": cond_latents[i]}
+            for i in range(cond.shape[0])
+        ]
+
+    @torch.inference_mode()
+    @torch.autocast(device_type='cuda', dtype=torch.bfloat16)
+    def result_from_ids(self, start_tokens: Tensor|List[int], generated_ids: Tensor,
+                        cond: Tensor, cond_latents: Tensor, only_ids: bool=False,
+                        return_decode_dict: bool=False, progress_callback=None) -> TokenRigResult:
+        """One sample's result from its generated tokens (the prompt not included):
+        the skeleton detokenized and, unless asked not to, its skin decoded."""
+        if not isinstance(start_tokens, Tensor):
+            start_tokens = torch.tensor(start_tokens, device=generated_ids.device)
+        output_ids = torch.cat([start_tokens.to(generated_ids.device, generated_ids.dtype),
+                                generated_ids])
+        res = TokenRigResult()
+        res.input_ids = start_tokens
+        res.output_ids = output_ids
+        if only_ids:
+            return res
+        res.cond = cond
+        res.cond_latents = cond_latents
+        if return_decode_dict:
+            return res
+        d = decode(
+            cond=cond,
+            cond_latents=cond_latents,
+            inputs_ids=output_ids,
+            tokenizer=self.tokenizer,
+            tokens_per_skin=self.tokens_per_skin,
+            vae=self.vae,
+            encode_repeat=DECODE_JOINT_BATCH,
+            progress_callback=progress_callback,
+        )
+        res.skin_pred = d['skin_pred']
+        res.detokenize_output = d['detokenize_output']
+        return res
+
+    def attach_asset(self, res: TokenRigResult, asset: Asset, sampled_vertices: np.ndarray,
+                     interpolate_skin: bool=True) -> TokenRigResult:
+        """Set ``res.asset``: *asset*'s mesh with the predicted skeleton and its
+        skin, interpolated onto the mesh vertices or, with
+        ``interpolate_skin=False``, left at *sampled_vertices*. Raises
+        ``ValueError`` for a rig that cannot be decoded."""
+        if res.detokenize_output is None:
+            raise ValueError("generation produced an undecodable skeleton")
+        if res.skin_pred is None:
+            where_eos = (
+                torch.where(res.output_ids == self.tokenizer.eos)[0]
+                if res.output_ids is not None else torch.empty(0)
             )
-            res.skin_pred = d['skin_pred']
-            res.detokenize_output = d['detokenize_output']
-            outputs.append(res)
-        return outputs
+            actual = 0
+            if res.output_ids is not None and where_eos.numel() > 0:
+                actual = max(0, res.output_ids.shape[0] - where_eos[0].item() - 1)
+            expected = res.detokenize_output.joints.shape[0] * self.tokens_per_skin
+            raise ValueError(
+                "generation produced incomplete skin tokens: "
+                f"expected {expected}, got {actual}"
+            )
+        sampled_skin = res.skin_pred.detach().float().cpu().numpy()
+        res.asset = Asset.from_data(
+            vertices=asset.vertices.copy(),
+            faces=asset.faces.copy() if asset.faces is not None else None,
+            sampled_vertices=sampled_vertices if interpolate_skin else None,
+            sampled_skin=sampled_skin if interpolate_skin else None,
+            joints=res.detokenize_output.joints,
+            parents=np.array(res.detokenize_output.parents),
+            joint_names=res.detokenize_output.joint_names,
+            cls=asset.cls,
+            path=asset.path,
+        )
+        if not interpolate_skin:
+            res.asset.sampled_vertices = sampled_vertices
+            res.asset.sampled_vertex_groups = {'skin': sampled_skin}
+        return res
 
     def _debug_export(
         self,
@@ -655,38 +730,9 @@ class TokenRig(ModelSpec):
             for s, res in enumerate(gen_results):
                 if make_asset:
                     assert 'model_input' in batch, "need model_input to make asset (in validate/predict mode)"
-                    if res.detokenize_output is None:
-                        raise ValueError("generation produced an undecodable skeleton")
-                    if res.skin_pred is None:
-                        where_eos = (
-                            torch.where(res.output_ids == self.tokenizer.eos)[0]
-                            if res.output_ids is not None else torch.empty(0, device=vertices.device)
-                        )
-                        actual = 0
-                        if res.output_ids is not None and where_eos.numel() > 0:
-                            actual = max(0, res.output_ids.shape[0] - where_eos[0].item() - 1)
-                        expected = res.detokenize_output.joints.shape[0] * self.tokens_per_skin
-                        raise ValueError(
-                            "generation produced incomplete skin tokens: "
-                            f"expected {expected}, got {actual}"
-                        )
-                    asset: Asset = batch['model_input'][i].asset
-                    sampled_vertices = vertices[i, s].detach().float().cpu().numpy()
-                    sampled_skin = res.skin_pred.detach().float().cpu().numpy()
-                    res.asset = Asset.from_data(
-                        vertices=asset.vertices.copy(),
-                        faces=asset.faces.copy() if asset.faces is not None else None,
-                        sampled_vertices=sampled_vertices if interpolate_skin else None,
-                        sampled_skin=sampled_skin if interpolate_skin else None,
-                        joints=res.detokenize_output.joints,
-                        parents=np.array(res.detokenize_output.parents),
-                        joint_names=res.detokenize_output.joint_names,
-                        cls=asset.cls,
-                        path=asset.path,
-                    )
-                    if not interpolate_skin:
-                        res.asset.sampled_vertices = sampled_vertices
-                        res.asset.sampled_vertex_groups = {'skin': sampled_skin}
+                    self.attach_asset(res, batch['model_input'][i].asset,
+                                      vertices[i, s].detach().float().cpu().numpy(),
+                                      interpolate_skin=interpolate_skin)
                 results.append(res)
         d['results'] = results
         return d

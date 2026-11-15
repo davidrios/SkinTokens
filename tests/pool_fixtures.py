@@ -6,7 +6,7 @@ processes, so keep it free of test-only imports.
 import os
 import time
 
-from src.server.worker import ServiceSpec, main as worker_main
+from src.server.worker import GenerationCancelled, ServiceSpec, main as worker_main
 
 
 def close_pipe_before_finalizers(*args):
@@ -126,3 +126,32 @@ def _run_gpu_stage(params, payload, cancellation, progress):
 
 STAGED_CPU = ServiceSpec("staged-cpu", _load, _run_cpu_stage)
 STAGED_GPU = ServiceSpec("staged-gpu", _load, _run_gpu_stage)
+
+
+# A batching worker (a spec with a serve loop): runs up to ``slots`` sleep
+# jobs at once in one process, as the continuous-batching GPU worker does.
+def _load_batched(options):
+    return {"fixture": True, "slots": options.get("slots", 2)}
+
+
+def _serve_batched(source):
+    running = {}  # job -> (deadline, start)
+    while True:
+        job = source.next(block=not running)
+        while job is not None:
+            if job.params.get("action") == "crash":
+                os._exit(3)
+            running[job] = (time.monotonic() + job.params["seconds"], time.time())
+            job = source.next(block=False)
+        for job, (deadline, started) in list(running.items()):
+            if job.cancellation.cancelled:
+                del running[job]
+                job.fail(GenerationCancelled(job.cancellation.reason))
+            elif time.monotonic() >= deadline:
+                del running[job]
+                job.progress({"progress": 50, "step": "half way", "elapsed_sec": 0.0})
+                job.reply([str(os.getpid()).encode(), repr((started, time.time())).encode()])
+        time.sleep(0.01)
+
+
+BATCHED = ServiceSpec("batched", _load_batched, _run, serve=_serve_batched)

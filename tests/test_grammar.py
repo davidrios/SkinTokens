@@ -75,6 +75,8 @@ def test_generate_continues_past_skeleton_eos(monkeypatch):
         mesh_encoder=None, output_proj=None, transformer=transformer,
         make_start_tokens=lambda **kwargs: [prompt],
     )
+    for helper in ("encode_condition", "prompt_tokens", "result_from_ids"):
+        setattr(model, helper, getattr(tokenrig.TokenRig, helper).__get__(model))
     results = tokenrig.TokenRig.generate(
         model, vertices=torch.zeros(3, 3), normals=torch.zeros(3, 3),
         only_ids=True, max_new_tokens=len(sequence),

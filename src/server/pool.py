@@ -1,13 +1,15 @@
 """Gateway side of the worker processes.
 
 A :class:`WorkerPool` runs a fixed number of worker processes
-(:mod:`src.server.worker`), each owning a copy of the model and running one
-request at a time, so up to ``size`` requests run in parallel: their parsing,
-GPU inference and export never wait on one another. The pool is sized as
+(:mod:`src.server.worker`), each owning a copy of the model. A worker runs
+one request at a time, or as many as the ``slots`` its load reported (a
+continuous-batching GPU worker, :mod:`src.server.pipeline`), so up to the
+pool's total slots requests run in parallel: their parsing, GPU inference
+and export never wait on one another. The pool is sized as
 *per-GPU workers* times the number of visible GPUs: workers are pinned to the
 cards round-robin (each sees its one GPU as ``cuda:0``). Requests wait for a
-free worker in FIFO order; a waiting request gets a once-per-second queue
-heartbeat.
+free slot in FIFO order and go to the least busy worker with one; a waiting
+request gets a once-per-second queue heartbeat.
 
 A request can be cancelled while it waits (it leaves the queue) or while it
 runs (the worker is told to stop it and is free again once it has).
@@ -127,13 +129,19 @@ class _Worker:
         self.ready: asyncio.Future = loop.create_future()
         self.info: dict = {}
         self.alive = True
-        self.job: Optional[_Job] = None
+        # The jobs sent to it and not answered yet, by id.
+        self.running: dict[int, _Job] = {}
         self.jobs_done = 0
         # Jobs and cancels are sent from pool threads, "stop" from the loop.
         self._send_lock = threading.Lock()
         self.reader = threading.Thread(target=self._read, name=f"{self.process.name}-events",
                                        daemon=True)
         self.reader.start()
+
+    @property
+    def slots(self) -> int:
+        """The jobs it runs at once (its load's ``slots``, else one)."""
+        return max(1, int(self.info.get("slots") or 1))
 
     @property
     def name(self) -> str:
@@ -176,17 +184,16 @@ class _Worker:
             if not self.ready.done():
                 self.ready.set_exception(RuntimeError(f"{self.name} failed to load:\n{message[1]}"))
         elif kind == "progress":
-            job = self.job
-            if job is not None and message[1] == job.id and job.on_progress is not None:
+            job = self.running.get(message[1])
+            if job is not None and job.on_progress is not None:
                 try:
                     job.on_progress(message[2])
                 except Exception:
                     logger.exception("progress callback failed")
         elif kind in ("result", "error"):
-            job = self.job
-            if job is None or message[1] != job.id:
+            job = self.running.pop(message[1], None)
+            if job is None:
                 return
-            self.job = None
             self.jobs_done += 1
             if not job.future.done():
                 if kind == "result":
@@ -202,10 +209,11 @@ class _Worker:
         code = self.process.exitcode
         if not self.ready.done():
             self.ready.set_exception(WorkerCrashed(f"{self.name} exited while loading (exit code {code})"))
-        job, self.job = self.job, None
-        if job is not None and not job.future.done():
-            job.future.set_exception(WorkerCrashed(
-                f"{self.name} exited (exit code {code}) while running this request"))
+        jobs, self.running = list(self.running.values()), {}
+        for job in jobs:
+            if not job.future.done():
+                job.future.set_exception(WorkerCrashed(
+                    f"{self.name} exited (exit code {code}) while running this request"))
         self.pool._on_worker_exit(self, code)
 
     def send(self, message: tuple) -> None:
@@ -312,8 +320,11 @@ class WorkerPool:
             await self.close()
             raise failures[0]
         self.info = self._workers[0].info
-        for worker in self._workers:
-            self._release(worker)
+        # One idle entry per free slot, interleaved across the workers.
+        for slot in range(max(w.slots for w in self._workers)):
+            for worker in self._workers:
+                if slot < worker.slots:
+                    self._release(worker)
         if self.cuda:
             logger.info("%s pool ready: %d worker%s across %d GPU%s (%d per GPU) in %.1fs",
                         self.label, self.size, "" if self.size == 1 else "s",
@@ -361,8 +372,7 @@ class WorkerPool:
                 worker.jobs.close()
 
     def _on_worker_exit(self, worker: _Worker, code: Optional[int]) -> None:
-        with suppress(ValueError):
-            self._idle.remove(worker)
+        self._idle = deque(w for w in self._idle if w is not worker)
         if self._closing or self._workers[worker.slot] is not worker:
             return
         if worker.ready.exception() is not None:
@@ -390,13 +400,15 @@ class WorkerPool:
                 return
             self.restarts += 1
             logger.info("%s replaced", worker.name)
-            self._release(worker)
+            for _ in range(worker.slots):
+                self._release(worker)
             return
 
     # ── dispatch ─────────────────────────────────────────────────────────────
 
     def _release(self, worker: _Worker) -> None:
-        """Hand a free worker to the longest-waiting request, or park it."""
+        """Hand a worker's free slot to the longest-waiting request, or park it
+        (``_idle`` holds one entry per free slot)."""
         if not worker.alive or self._closing:
             return
         while self._waiters:
@@ -409,6 +421,12 @@ class WorkerPool:
     def would_queue(self) -> bool:
         """Whether a request submitted now would wait for a worker."""
         return not self._idle or bool(self._waiters)
+
+    def _take_idle(self) -> _Worker:
+        """A free slot of the least busy worker that has one."""
+        worker = min(self._idle, key=lambda w: len(w.running))
+        self._idle.remove(worker)
+        return worker
 
     def _enqueue(self, waiter: asyncio.Future, urgent: bool) -> None:
         if not urgent:
@@ -427,7 +445,7 @@ class WorkerPool:
         if cancelled is not None and cancelled.is_set():
             raise GenerationCancelled("generation cancelled")
         if self._idle and not self._waiters:
-            return self._idle.popleft()
+            return self._take_idle()
         waiter = self._loop.create_future()
         self._enqueue(waiter, urgent)
         heartbeat = None
@@ -472,7 +490,7 @@ class WorkerPool:
 
     def _cancel(self, worker: _Worker, job: _Job, reason: str) -> None:
         """Ask the worker to stop *job* (off the loop: a job send may hold the pipe)."""
-        if job.cancel_sent or job.future.done() or worker.job is not job:
+        if job.cancel_sent or job.future.done() or worker.running.get(job.id) is not job:
             return
         job.cancel_sent = True
         self._loop.run_in_executor(None, worker.try_send, ("cancel", job.id, reason))
@@ -521,7 +539,7 @@ class WorkerPool:
             logger.debug("%s exited before its job was sent; taking the next worker", worker.name)
         job = _Job(next(self._ids), self._loop.create_future(), on_progress)
         job.future.add_done_callback(_retrieve)
-        worker.job = job
+        worker.running[job.id] = job
         sending = asyncio.ensure_future(
             asyncio.to_thread(worker.send, ("job", job.id, params, upload)))
         sending.add_done_callback(lambda task: self._sent(worker, job, task))
@@ -546,8 +564,8 @@ class WorkerPool:
                     f"{worker.name} exited before it received this request"))
             return
         # Nothing reached the worker (the job could not be pickled).
-        if worker.job is job:
-            worker.job = None
+        if worker.running.get(job.id) is job:
+            del worker.running[job.id]
             if not job.future.done():
                 job.future.set_exception(exc)
             self._release(worker)
@@ -562,7 +580,9 @@ class WorkerPool:
             "per_gpu": self.per_gpu,
             "gpus": self.gpus,
             "ready": len(ready),
-            "busy": sum(1 for w in ready if w.job is not None),
+            "slots": sum(w.slots for w in ready),
+            "busy": sum(1 for w in ready if w.running),
+            "running": sum(len(w.running) for w in ready),
             "idle": len(self._idle),
             "queued": sum(1 for waiter in self._waiters if not waiter.done()),
             "restarts": self.restarts,

@@ -4,9 +4,11 @@ At every concurrency level, sends a number of requests drawn at random from the
 input files, from N concurrent clients. For each request it records the latency,
 the time spent waiting for a worker, and a hash of the output.
 
-Every request uses a fixed seed (``--seed`` plus its index in the run), so the
-same input and seed should produce identical bytes at any concurrency on one
-build. ``compare`` reports any (input, seed) pair whose hashes differ across the
+Every request uses a fixed seed (``--seed`` plus its index in the run).
+Without continuous batching (``SKINTOKENS_BATCH_SLOTS=0``), the same input and
+seed should produce identical bytes at any concurrency on one build. With
+batching, a few pairs may differ (see the README's note on reproducibility).
+``compare`` reports any (input, seed) pair whose hashes differ across the
 reports it is given.
 
 Usage::

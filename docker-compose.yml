@@ -26,6 +26,9 @@ services:
       # (workers are pinned to the cards round-robin), and up to that many
       # requests are on the GPUs at once.
       SKINTOKENS_WORKERS: ${SKINTOKENS_WORKERS:-1}
+      # Requests each GPU worker decodes at once (continuous batching): 1, 2
+      # or 4; 0 turns batching off.
+      SKINTOKENS_BATCH_SLOTS: ${SKINTOKENS_BATCH_SLOTS:-4}
       # CPU worker processes (no model, no GPU) that parse uploads and export
       # results beside the GPU work; 0 = twice the GPU workers.
       SKINTOKENS_CPU_WORKERS: ${SKINTOKENS_CPU_WORKERS:-0}
@@ -48,7 +51,6 @@ services:
       # Copy out with: docker compose cp skintokens:/data/outputs/dump/<date>/<request_id> .
       SKINTOKENS_OUTPUT_ROOT: /data/outputs
       SKINTOKENS_LOG_LEVEL: ${SKINTOKENS_LOG_LEVEL:-INFO}
-      SKINTOKENS_USE_CACHE: 1
       SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE: 1
       SKINTOKENS_FAST_DECODE: 1
       SKINTOKENS_FAST_DECODE_BACKEND: inductor
