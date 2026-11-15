@@ -69,12 +69,6 @@ services:
       timeout: 5s
       retries: 5
       start_period: 120s
-    networks:
-      - ai-shared
 
 volumes:
   skintokens-outputs:
-
-networks:
-  ai-shared:
-    external: true
