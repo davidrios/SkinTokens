@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import os
 import secrets
 import time
@@ -11,6 +12,66 @@ from tqdm import tqdm
 
 os.environ["XFORMERS_IGNORE_FLASH_VERSION_CHECK"] = "1"
 
+
+def _install_lightning_stub() -> None:
+    """Register a minimal stand-in for ``lightning`` before ``src`` imports it.
+
+    Inference only uses Lightning's base classes, but importing it costs ~3.3s:
+    it imports all of torchmetrics (text/image/audio metrics, torchvision,
+    scipy.signal) just to read its version. The stand-in provides only what the
+    inference path touches; set SKINTOKENS_REAL_LIGHTNING=1 to use the real one.
+    """
+    import sys
+    import types
+    from typing import Any
+
+    class LightningModule(torch.nn.Module):
+        _trainer = None
+        current_epoch = 0
+        global_step = 0
+
+        @property
+        def trainer(self):
+            raise RuntimeError("demo.py runs without a Lightning Trainer")
+
+        @property
+        def device(self) -> torch.device:
+            param = next(self.parameters(), None)
+            return param.device if param is not None else torch.device("cpu")
+
+        def save_hyperparameters(self, *args, **kwargs) -> None:
+            pass
+
+        def on_load_checkpoint(self, checkpoint) -> None:
+            pass
+
+    class LightningDataModule:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+    lightning = types.ModuleType("lightning")
+    pytorch = types.ModuleType("lightning.pytorch")
+    utilities = types.ModuleType("lightning.pytorch.utilities")
+    types_mod = types.ModuleType("lightning.pytorch.utilities.types")
+    pytorch.LightningModule = LightningModule
+    pytorch.LightningDataModule = LightningDataModule
+    types_mod.EVAL_DATALOADERS = types_mod.TRAIN_DATALOADERS = Any
+    lightning.pytorch, pytorch.utilities, utilities.types = pytorch, utilities, types_mod
+    sys.modules.update({
+        "lightning": lightning,
+        "lightning.pytorch": pytorch,
+        "lightning.pytorch.utilities": utilities,
+        "lightning.pytorch.utilities.types": types_mod,
+    })
+
+
+if os.environ.get("SKINTOKENS_REAL_LIGHTNING", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+    _install_lightning_stub()
+    # transformers imports scikit-learn (~0.6s) only for assisted generation,
+    # which greedy decoding never uses; a None entry makes it look absent.
+    import sys
+    sys.modules.setdefault("sklearn", None)
+
 from src.data.dataset import DatasetConfig, RigDatasetModule
 from src.data.seeding import derive_seed, enable_deterministic_kernels, sample_point_clouds, seeded_rng
 from src.data.transform import Transform
@@ -19,6 +80,13 @@ from src.tokenizer.parse import get_tokenizer
 from src.server.spec import get_model
 from src.paths import EXPERIMENTS_DIR
 from src.rig_package.parser.glb import transfer_rigging
+from src.model import decode_attention
+from src.model.grammar import enable_cuda_deferred_stop
+from src.server import config as server_config
+from src.server.pipeline import _get_fast_decode_compile_config, _set_llm_attention
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 MODEL_CKPTS = [
     str(EXPERIMENTS_DIR / "articulation_xl_quantization_256_token_4/grpo_1400.ckpt"),
@@ -31,6 +99,27 @@ CURRENT_MODEL_CKPT: Optional[str] = None
 CURRENT_HF_PATH: Optional[str] = None
 
 
+@contextlib.contextmanager
+def skip_weight_init():
+    """Make torch.nn.init a no-op while the model is built.
+
+    Every weight is overwritten by the checkpoint right after (loaded with
+    strict=True, so a weight missing from it is an error, never left random),
+    which makes the random init (~1.2s) wasted work.
+    """
+    import torch.nn.init as init
+    names = [n for n in dir(init) if n.endswith("_") and not n.startswith("_")
+             and callable(getattr(init, n))]
+    saved = {n: getattr(init, n) for n in names}
+    for n in names:
+        setattr(init, n, lambda tensor, *a, **k: tensor)
+    try:
+        yield
+    finally:
+        for n, fn in saved.items():
+            setattr(init, n, fn)
+
+
 def load_model(model_ckpt: str, hf_path: Optional[str], device: Optional[str] = None) -> Tuple[str, str]:
     global model, tokenizer, transform, CURRENT_MODEL_CKPT, CURRENT_HF_PATH
     if model is not None and model_ckpt == CURRENT_MODEL_CKPT and hf_path == CURRENT_HF_PATH:
@@ -40,7 +129,10 @@ def load_model(model_ckpt: str, hf_path: Optional[str], device: Optional[str] = 
         raise RuntimeError("model_ckpt is empty. Please select a checkpoint.")
 
     print(f"Loading model: {model_ckpt}, hf_path={hf_path}")
-    model = get_model(model_ckpt, hf_path=hf_path, device=device)
+    started_at = time.perf_counter()
+    with skip_weight_init():
+        model = get_model(model_ckpt, hf_path=hf_path, device=device)
+    print(f"[PROFILE] Model load: {time.perf_counter() - started_at:.2f}s")
     assert model.tokenizer_config is not None
     tokenizer = get_tokenizer(**model.tokenizer_config)
     transform = Transform.parse(**model.transform_config["predict_transform"])
@@ -95,7 +187,31 @@ def run_rig(
     # at the cost of ~25% decode speed.
     if os.environ.get("SKINTOKENS_DETERMINISTIC", "0").strip().lower() in {"1", "true", "yes", "on"}:
         enable_deterministic_kernels()
+    # Same decode setup as the server (src/server/pipeline.py): generate() checks
+    # for its end one step late instead of syncing every token, and the fast path
+    # decodes over a static KV cache with CUDA-graph replay.
+    decode_attention.register()
+    enable_cuda_deferred_stop()
     load_model(model_ckpt, hf_path)
+
+    generate_kwargs = dict(
+        max_new_tokens=server_config.MAX_NEW_TOKENS,
+        use_cache=server_config.USE_GENERATION_CACHE,
+    )
+    fast_decode = server_config.FAST_DECODE and torch.device(model.device).type == "cuda"
+    if fast_decode:
+        try:
+            generate_kwargs.update(
+                cache_implementation="static",
+                compile_config=_get_fast_decode_compile_config(),
+            )
+            _set_llm_attention(model, decode_attention.DECODE_ATTN_IMPL)
+        except Exception as exc:
+            print(f"[fast-decode] unavailable ({exc}); using the default path")
+            fast_decode = False
+    print(f"[fast-decode] {'on' if fast_decode else 'off'}"
+          + (f" ({decode_attention.DECODE_ATTN_MODE} attention, {server_config.FAST_DECODE_BACKEND})"
+             if fast_decode else ""))
 
     datapath = {
         "data_name": None,
@@ -146,14 +262,14 @@ def run_rig(
         batch.pop("skeleton_mask", None)
 
         # Decoding is fixed to greedy single-beam search.
-        batch["generate_kwargs"] = dict(max_new_tokens=2048)
+        batch["generate_kwargs"] = dict(generate_kwargs)
 
         # Synchronize around the timed section so CUDA work launched
         # asynchronously is included in the measured inference duration.
         # Batch loading/GLB parsing and GLB export both happen outside it.
         synchronize_inference_device()
         inference_started_at = time.perf_counter()
-        with seeded_rng(seed):
+        with seeded_rng(seed), torch.inference_mode():
             preds: List[TokenRigResult] = model.predict_step(
                 batch,
                 make_asset=True,
