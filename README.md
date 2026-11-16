@@ -14,14 +14,18 @@
 
 **SkinTokens** is a learned, compact, and discrete representation for skinning weights. Built on this representation, **TokenRig** is a unified autoregressive framework that models the entire rig, i.e., skeleton and skinning weights, as a single token sequence. Given an input 3D mesh, it generates a complete skeleton hierarchy and skin weights that can be directly imported into standard 3D pipelines for character animation and simulation.
 
-SkinTokens is the successor to [UniRig](https://github.com/VAST-AI-Research/UniRig) (SIGGRAPH '25). While UniRig uses separate stages for skeleton prediction and skinning, SkinTokens unifies both into a single autoregressive sequence via learned discrete skin tokens, yielding **98%–133%** improvement in skinning accuracy and **17%–22%** improvement in bone prediction over state-of-the-art baselines.
+This is the [marklalon/SkinTokens fork](https://github.com/marklalon/SkinTokens) of [VAST-AI-Research/SkinTokens](https://github.com/VAST-AI-Research/SkinTokens). The paper, project page, hosted demo and pretrained weights linked above belong to the upstream project; they do not describe or demonstrate this fork's serving behavior.
+
+This fork focuses on inference: native GLB/glTF I/O without Blender, a WebSocket service with separate CPU/GPU workers and continuous batching, CUDA-graph decoding, and compact rig payloads that clients apply to the original asset while keeping its materials and textures. `demo.py` is CLI-only; the local Gradio UI has been removed. Training and GRPO launchers are not included.
+
+SkinTokens is the successor to [UniRig](https://github.com/VAST-AI-Research/UniRig) (SIGGRAPH '25). While UniRig uses separate stages for skeleton prediction and skinning, SkinTokens unifies both into a single autoregressive sequence via learned discrete skin tokens.
 
 ## 🔮 Overview
 
-TokenRig takes a **single 3D mesh** as input and autoregressively produces a fully rigged asset — a coherent skeleton hierarchy plus dense per-vertex skinning weights — in a single unified sequence. Method in three stages:
+The upstream method takes a **single 3D mesh** as input and autoregressively produces a skeleton hierarchy plus skinning weights in a single sequence. Its research pipeline has three stages (this repository provides inference with pretrained models):
 
 1. **Learn SkinTokens** — An FSQ-CVAE compresses sparse skinning weights into a compact discrete vocabulary.
-2. **Unified Autoregressive Modeling** — A Qwen3-0.6B-based Transformer generates the full rig (skeleton followed by SkinTokens) as one interleaved sequence.
+2. **Unified Autoregressive Modeling** — A Qwen3-0.6B-based Transformer generates the full rig as one sequence: skeleton tokens followed by SkinTokens.
 3. **RL Refinement via GRPO** — Tailored geometric and semantic rewards (volumetric joint coverage, bone-mesh containment, skinning sparsity, deformation smoothness) refine the model for out-of-distribution assets.
 
 <p align="center">
@@ -39,17 +43,17 @@ See the [project page](https://zjp-shadow.github.io/works/SkinTokens/) for the f
 ## 📦 Installation
 
 ### Prerequisites
-- **Hardware**: An NVIDIA GPU with at least **14 GB** of memory is required for inference.
+- **Hardware**: An NVIDIA GPU is recommended for inference and required for CUDA-graph decoding and continuous batching. VRAM use depends on the mesh, skeleton, worker count and active batch size; the upstream 14 GB requirement is not a measured minimum for this fork. A CPU fallback is available with `SKINTOKENS_DEVICE=cpu`, without CUDA acceleration.
 - **Software**:
   - Python >= 3.11
-  - [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit-archive) >= 12.1
+  - A driver compatible with the installed PyTorch CUDA build (the commands below use CUDA 12.8). A local CUDA toolkit is needed when building CUDA extensions such as optional flash-attn.
   - [uv](https://docs.astral.sh/uv/) is recommended for managing dependencies.
 
 ### Installation Steps
 
 1. Clone the repo:
     ```sh
-    git clone https://github.com/VAST-AI-Research/SkinTokens.git
+    git clone https://github.com/marklalon/SkinTokens.git
     cd SkinTokens
     ```
 
@@ -57,11 +61,11 @@ See the [project page](https://zjp-shadow.github.io/works/SkinTokens/) for the f
     ```sh
     uv venv --python 3.11
     source .venv/bin/activate
-    uv pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+    uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
     ```
 
     > [!NOTE]
-    > Adjust the CUDA version in the PyTorch index URL to match your driver. See [PyTorch Get Started](https://pytorch.org/get-started/locally/) for other CUDA versions.
+    > On Windows PowerShell, activate with `.\.venv\Scripts\Activate.ps1`. The CUDA build must be supported by your NVIDIA driver. Torchvision and torchaudio are not needed for inference.
 
 3. Install dependencies:
     ```sh
@@ -75,18 +79,18 @@ See the [project page](https://zjp-shadow.github.io/works/SkinTokens/) for the f
 
     > [!NOTE]
     > flash-attn is optional. Without it, the LLM and VAE use PyTorch SDPA
-    > (auto-detected). Force a backend with `SKINTOKENS_ATTN_IMPL=sdpa|eager|flash_attention_2`.
+    > (auto-detected). `SKINTOKENS_ATTN_IMPL=sdpa|eager|flash_attention_2` selects the LLM's standard attention backend; fast single-token decode has its own `SKINTOKENS_DECODE_ATTN` setting below.
 
 5. Download pretrained models:
     ```sh
     python download.py --model
     ```
 
-    This downloads the TokenRig and FSQ-CVAE checkpoints to `experiments/`, and the Qwen3-0.6B config to `models/`.
+    By default this downloads the TokenRig and FSQ-CVAE checkpoints to `experiments/`, and the Qwen3-0.6B config/tokenizer files to `models/Qwen3-0.6B/` (not the separate Qwen model weights). The downloader places these under `SKINTOKENS_MODEL_ROOT` when set; `SKINTOKENS_EXPERIMENTS_DIR` changes checkpoint lookup, not the download destination.
 
 ## 🤖 Pretrained Models
 
-We provide the following pretrained models on [Hugging Face](https://huggingface.co/VAST-AI/SkinTokens):
+The fork uses the upstream pretrained models on [Hugging Face](https://huggingface.co/VAST-AI/SkinTokens):
 
 | Model | Description | Download |
 | --- | --- | --- |
@@ -97,15 +101,21 @@ We provide the following pretrained models on [Hugging Face](https://huggingface
 
 ### Hugging Face Space Demo
 
-The easiest way to try TokenRig without any local setup is the hosted [Hugging Face Space](https://huggingface.co/spaces/VAST-AI/SkinTokens) — upload a mesh and get a rigged result in the browser.
+The upstream [Hugging Face Space](https://huggingface.co/spaces/VAST-AI/SkinTokens) is linked for reference. It runs independently of this fork.
 
-### Gradio Demo (local)
+### WebSocket Server and Python Client
 
 ```sh
-python demo.py
+python serve.py
 ```
 
-Then open `http://127.0.0.1:1024` in your browser.
+The server listens on port 8087 by default. `GET /health` reports readiness and supported output formats; `WS /ws/generate` accepts generation requests. There is no browser UI or REST generation endpoint. After the model finishes loading, run the client in another terminal:
+
+```sh
+python skintokens_client.py --server http://127.0.0.1:8087 --input examples/giraffe.glb --output results/giraffe.glb
+```
+
+The client needs `websockets` (included via `uvicorn[standard]`), NumPy, SciPy and this repository's `src` package, but no PyTorch or GPU on the client machine. By default it requests a compact rig payload and adds the rig to the original asset, preserving materials and textures. For GLB inputs it uploads a reduced geometry-only representation; the original file stays on the client for reconstruction.
 
 ### Command Line
 
@@ -113,21 +123,24 @@ Then open `http://127.0.0.1:1024` in your browser.
 # Rig a single model
 python demo.py --input examples/giraffe.glb --output results/giraffe.glb
 
-# Batch process a directory (output defaults to outputs/{input_name}_bind.glb)
-python demo.py --input examples/
-
-# Process directory with custom output directory
+# Recursively process a directory, keeping relative paths under results/
 python demo.py --input examples/ --output results/
 ```
 
-Inputs may be `.glb` or `.gltf` (with embedded or adjacent resources); any existing skin/skeleton in the input is ignored, and results are always a skinned-mesh-only `.glb` (materials and textures are not exported). Only triangle geometry is processed (triangle strips/fans are triangulated); points and lines are ignored, and files without triangles are rejected. Geometry I/O is native Python/NumPy (`src/rig_package/glb_io`) — Blender (`bpy`) is not required, and FBX is not supported (convert FBX to GLB first). Draco/meshopt-compressed GLBs and the `EXT_mesh_gpu_instancing` extension are not supported; expand instances before importing.
+`demo.py` exports a skinned-mesh-only `.glb`, without materials or textures. For a single file, the default output is `outputs/{input_name}_bind.glb`; specify an explicit output directory for directory inputs. Multiple samples add `_0`, `_1`, etc. to the output stem. Both the CLI and Python client ground the result by default; pass `--no-auto-ground` to preserve placement (the client requires `--output-format rig` for this option).
+
+Inputs may be `.glb` or `.gltf`. Local CLI input can reference adjacent resources; server uploads and the Python client require embedded geometry buffers, since only one file is sent. Embed images as well for a self-contained result. Existing skins are not used to condition generation: the skeleton and weights are always generated anew. Only triangle geometry is processed (triangle strips/fans are triangulated); points and lines are ignored during inference, and files without triangles are rejected. Geometry I/O is native Python/NumPy/SciPy (`src/rig_package/glb_io`) — Blender (`bpy`) is not required, and FBX is not supported (convert FBX to GLB first). Draco/meshopt-compressed GLBs and the `EXT_mesh_gpu_instancing` extension are not supported; expand instances before importing.
 
 ### Docker (NVIDIA GPU)
 
 The image is self-contained: the `Dockerfile` copies the project source and the
-model checkpoints (`experiments/`, `models/`) into the image at build time, so
-there is nothing to download or copy before starting. Only the outputs and logs
-live on an external Docker volume.
+model checkpoints (`experiments/`, `models/`) into the image at build time.
+Run `python download.py --model` on the host before building. The default base
+image, `torch-runtime:2.11.0-cu128-py3.11`, must also be available locally or
+from your registry; this repository does not build it. The image contains only
+the service runtime, not `demo.py`, the client or `examples/`. Logs and failure
+dumps live on the `skintokens-outputs` Docker volume; generated results are sent
+to clients and saved by the client.
 
 ```powershell
 # Build and start the service
@@ -138,26 +151,31 @@ docker compose up -d
 The image is based on `torch-runtime:2.11.0-cu128-py3.11` (PyTorch 2.11 + CUDA
 12.8 + Triton preinstalled). Override it with `$env:SKINTOKENS_BASE_IMAGE`.
 
-Open `http://127.0.0.1:8087`. To run command-line inference inside the same
-environment:
+Check `http://127.0.0.1:8087/health`, then run the client on the host:
 
 ```powershell
-docker compose run --rm skintokens python demo.py `
+python skintokens_client.py --server http://127.0.0.1:8087 `
   --input examples/giraffe.glb --output results/giraffe.glb
 ```
 
-Paths can be overridden with `SKINTOKENS_MODEL_ROOT`,
+For local Python execution, paths can be overridden with `SKINTOKENS_MODEL_ROOT`,
 `SKINTOKENS_EXPERIMENTS_DIR`, and `SKINTOKENS_DATA_ROOT`. This also makes saved
 checkpoint references such as `experiments/...` portable between host training
 and containers.
 
-Docker defaults to one sample per request and CUDA cache release after each
-request. To keep the CUDA cache between requests, set:
+Requests default to one sample. Compose allows up to four samples per request
+(`SKINTOKENS_MAX_NUM_SAMPLES=4`), while standalone `serve.py` allows one by
+default. CUDA cache release is enabled. To disable it for a one-off container:
 
 ```powershell
-$env:SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE = "0"
-docker compose up -d
+docker compose run --rm --service-ports -e SKINTOKENS_EMPTY_CACHE_AFTER_INFERENCE=0 skintokens
 ```
+
+Stop the existing service before using `--service-ports`. For the regular
+service, edit `environment` in `docker-compose.yml` or use a Compose override.
+Only values written as `${...}` in the Compose file inherit host environment
+variables; settings such as fast decode, cache release and `shm_size` are
+currently literal values.
 
 The server runs each request in three stages on two pools of worker
 processes: a CPU worker parses the upload and samples its point clouds, a GPU
@@ -169,33 +187,38 @@ of the model; `SKINTOKENS_WORKERS` (default 1) sets the number of GPU workers
 (default 0 = twice the GPU workers) sets the number of CPU workers, which load
 no model and see no GPU. A request waiting for a stage queues in FIFO order
 (exports ahead of new parses) and receives `queue_ahead` heartbeats. Each GPU
-worker needs roughly 2-4 GB of VRAM, plus its batch's KV cache (about 280 MB
-per slot). Measure concurrent throughput with:
+worker holds its own model weights and KV caches; memory use grows with active
+slots and skin decoding. Measure concurrent throughput on your hardware with:
 
 ```powershell
-python load_test.py run --server http://127.0.0.1:8087 --concurrency 4 --requests 12 --out after.json
-python load_test.py compare before.json after.json
+python load_test.py run --server http://127.0.0.1:8087 --concurrency 4 --requests 12 --out "$env:TEMP/skintokens-after.json"
+python load_test.py compare "$env:TEMP/skintokens-before.json" "$env:TEMP/skintokens-after.json"
 ```
+
+Save a baseline report as `skintokens-before.json` in the same temporary
+directory before changing the server configuration and running the comparison.
 
 A GPU worker batches its requests continuously
 (`src/model/batch_decode.py`). It takes up to `SKINTOKENS_BATCH_SLOTS`
 (default 4; 1, 2, 3 or 4) requests at once and decodes their point clouds
 together, one per slot. A request joins as soon as a slot frees and leaves
-when its rig ends, without waiting for the others. A decode step over four
-rows costs little more than a step over one, so a single worker serves
-several requests in about the time of one; larger batches gain nothing more.
+when its rig ends, without waiting for the others. Each sample consumes a
+decode row, so a multi-sample request may occupy several slots. Batching can
+improve throughput; speedup depends on hardware and workload.
 Each batch size's decode step is captured once as a CUDA graph. The decode
 batch matches the number of active rows: three rows use batch 3, even with
 four slots configured.
 `SKINTOKENS_BATCH_SLOTS=0`, or fast decode off, or a CPU device, serves one
 request at a time through `transformers`' `generate`, as before.
 
-More than one worker per GPU does not help with batching: the workers take
-turns on the GPU and split the requests that would otherwise share a batch.
+Start with one worker per GPU: additional workers duplicate model memory and
+split requests that could otherwise share a batch. Benchmark before increasing
+the worker count.
 
 With `SKINTOKENS_FAST_DECODE_BACKEND=inductor` (the Compose default), the
 step is compiled before it is captured: startup takes longer, but each step
-is substantially faster than the unfused path.
+can run faster than the unfused path. Standalone Python defaults to
+`SKINTOKENS_FAST_DECODE_BACKEND=cudagraphs`, which does not require Triton.
 
 > [!NOTE]
 > Results are not exactly reproducible under batching. Decoding is greedy,
@@ -204,7 +227,8 @@ is substantially faster than the unfused path.
 > coordinate bins) can go either way and the same input and `seed` may give
 > a slightly different rig depending on the server's load.
 > `SKINTOKENS_DETERMINISTIC` does not remove this. Without batching
-> (`SKINTOKENS_BATCH_SLOTS=0`), a seed reproduces as before.
+> (`SKINTOKENS_BATCH_SLOTS=0`), use `SKINTOKENS_DETERMINISTIC=1` for
+> reproducibility across workers and restarts on the same hardware/software stack.
 
 With fast decode on (the default) each decode step replays a CUDA graph, and
 these switches control the rest of the step (defaults shown; set them to
@@ -212,23 +236,22 @@ compare or to fall back):
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SKINTOKENS_DECODE_ATTN` | `triton` (`math` without Triton) | Decode attention over the static cache: `triton` computes only the filled slots, `math` is fused grouped-query attention over the whole cache, `sdpa` is the previous memory-efficient SDPA path. |
+| `SKINTOKENS_DECODE_ATTN` | `triton` (`math` without Triton) | Decode attention over the static cache: `triton` skips unfilled cache blocks, `math` uses tensor operations over the whole cache (fused with inductor), and `sdpa` uses PyTorch SDPA. |
 | `SKINTOKENS_GPU_GRAMMAR` | `1` | Enforce the rig-token grammar with GPU state tensors instead of copying the sequence to the CPU every token. |
 | `SKINTOKENS_GRAMMAR_COMPILE` | `1` with CUDA + Triton | Fuse the grammar step (state update and logit mask) into one compiled function. |
 | `SKINTOKENS_DEFERRED_STOP` | `1` | Check for the end of generation one step late on CUDA, so the host never waits for the GPU between tokens. |
-| `SKINTOKENS_DETERMINISTIC` | `0` | Set to `1` for deterministic kernels. Without batching (`SKINTOKENS_BATCH_SLOTS=0`), a seed then reproduces the same rig on every worker and across restarts. With batching, results still depend on the other rows in the batch (see the note above). Off, decoding is about a third faster (2.1 vs 3.3 ms/token at batch 1), but a seed then reproduces only within one worker process. |
+| `SKINTOKENS_DETERMINISTIC` | `0` | Set to `1` for deterministic kernels, at a performance cost. Without batching (`SKINTOKENS_BATCH_SLOTS=0`), this supports seed reproducibility across workers and restarts on the same hardware/software stack. With batching, results still depend on the other rows in the batch. Off, a seed only supports reproducibility within one worker process with the same execution path. |
 
 `/dev/shm` can be adjusted with
-`SKINTOKENS_SHM_SIZE`; the Compose default is `1gb` because inference uses
-single-worker dataloading.
+the `shm_size` field in `docker-compose.yml` (currently `1gb`); there is no
+`SKINTOKENS_SHM_SIZE` interpolation in the supplied Compose file.
 
 > [!NOTE]
 > This public repository currently contains no training launcher or training
 > configuration, and both published model classes leave `training_step()`
-> unimplemented. The image includes Lightning and mounts the project read-write,
-> so upstream/private training code can be run with
-> `docker compose run --rm skintokens python <training-entrypoint>`, but the
-> released source itself cannot start model training as-is.
+> unimplemented. The image includes Lightning but only copies inference runtime
+> files and does not bind-mount the source. Training requires additional code,
+> configuration and an appropriate image or explicit source mount.
 
 ### Generation Parameters
 
@@ -240,8 +263,8 @@ WebSocket API take those and `output`, the result format:
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `--num-samples` | 1 | Rigs per input. The server rejects values above `SKINTOKENS_MAX_NUM_SAMPLES` (default: 1, configurable from 1 to 8). Sample `i` is decoded from its own point sampling of the mesh, so the samples differ from each other. |
-| `--seed` | random | Seed for the point sampling. The same input, seed and `--num-samples` give identical outputs on the same GPU and software stack. Without it a random seed is used and printed (the server returns it in each `done` message). |
+| `--num-samples` (WebSocket: `num_samples`) | 1 | Rigs per input. The server rejects values above `SKINTOKENS_MAX_NUM_SAMPLES` (standalone default: 1; Compose: 4; configurable from 1 to 8). Each sample uses its own point sampling; different rigs are not guaranteed. The local CLI only enforces a minimum of 1. |
+| `--seed` (WebSocket: `seed`) | random | Seed for point sampling, in `[0, 2**63)`. Without it a random seed is printed by the CLI/client and returned in every server `done` message. Exact rig reproducibility also depends on deterministic kernels, the execution path and batching, as described above. |
 | `--output-format` (WebSocket: `output`) | `rig` | What the server sends: `rig`, a rig payload that the client turns into the uploaded file with the skeleton and skin added (see [Server Results: Rig Payloads](#server-results-rig-payloads)); or `glb`, the server's skinned-mesh-only GLB, served only with `SKINTOKENS_ENABLE_GLB_OUTPUT=1`. |
 
 ### GLB Weight Encoding
@@ -259,30 +282,34 @@ on geometry and index sizes.
 
 Most of a rigged GLB is the input's own positions, normals and triangles,
 which the client already has. So the server returns a **rig payload** by default:
-just the skeleton and the per-vertex joint influences, zlib-compressed. On
-`examples/giraffe.glb` that is 96 KB instead of a 670 KB GLB. Nothing is
-approximated, and the client adds the rig to the very file it uploaded, so the
-result keeps everything the server's skinned-mesh-only GLB drops.
+just the skeleton and the per-vertex joint influences, with the binary arrays
+zlib-compressed. Payload size depends on the asset. It uses the same four
+influences and normalized 16-bit weights as the default server GLB export,
+without an additional lossy compression step. The client adds the rig to its
+original asset, preserving data that the server's skinned-mesh-only GLB drops.
 
 | Client | How |
 | --- | --- |
 | Python | `skintokens_client.py` does it by default. In code: `apply_rig(uploaded_bytes, payload, name="input.glb")` from `src.rig_package.glb_io` returns the input as a GLB with the rig added. (`build_glb` with the same arguments returns the server's GLB instead, byte for byte.) |
 | three.js | [`clients/threejs/skintokens-rig.js`](clients/threejs/skintokens-rig.js): `await applyRigPayload(gltf, await decodeRigPayload(payload))` turns the meshes `GLTFLoader` loaded from the uploaded file into `SkinnedMesh`es on the new skeleton. |
 
-`apply_rig` keeps the input's node hierarchy and transforms, materials,
-textures, UVs, animations, extensions and all existing data. Embedded `.gltf`
+`apply_rig` preserves the input's node hierarchy, materials, textures, UVs,
+animation data, extensions and extras while replacing its skin bindings.
+Preserved animations are not retargeted to the generated skeleton. Embedded `.gltf`
 buffers move into the GLB's binary chunk, with their bytes unchanged. It only
 adds the following:
 - **Skeleton:** an armature node holding the joints, added to the default scene.
 - **Skins:** each inverse bind matrix includes the mesh node's placement, so vertex data is left as stored. glTF ignores a skinned mesh node's own transform. Skins of the input that no node refers to any more are dropped.
-- **`JOINTS_0`/`WEIGHTS_0`:** added to every primitive of the rigged meshes, replacing any the input had. Points and lines take the influences of their nearest rigged vertex.
+- **`JOINTS_0`/`WEIGHTS_0`:** added to every primitive of the rigged meshes, replacing existing joint/weight attributes (including additional influence sets). Points and lines take the influences of their nearest rigged vertex.
 - **Mesh copies:** a mesh used by several nodes gets one copy per extra node, sharing its geometry, so each use can have its own weights.
 
-The model keeps its place; the server's ground shift is not applied. The
-glTF validator reports no errors on these files. It does warn
-`NODE_SKINNED_MESH_NON_ROOT`/`NODE_SKINNED_MESH_LOCAL_TRANSFORMS` when a
-rigged mesh sits under transformed nodes: that's the kept hierarchy, and the
-skins already account for it.
+The Python API `apply_rig` defaults to `auto_ground=False`; the Python CLI
+client passes `auto_ground=True` unless `--no-auto-ground` is set. The three.js
+helper preserves placement unless passed `{ ground: true }`. Grounding applies
+the payload's world-space shift (Y-up in glTF) to the scene roots and armature.
+The glTF validator may warn `NODE_SKINNED_MESH_NON_ROOT` or
+`NODE_SKINNED_MESH_LOCAL_TRANSFORMS` for preserved transformed hierarchies;
+the inverse bind matrices account for mesh placement.
 
 **Protocol.** The request header names the format: `{"filename": ..., "output": "rig"}`.
 `output` defaults to `"rig"`, and `/health` lists the formats the server
@@ -310,12 +337,17 @@ Rows follow `layout`, which spells out the vertex order:
 - A mesh used by several nodes appears once per node.
 - `skinned_input` marks nodes that were skinned in the input. The server used their vertices as stored and ignored their node transform.
 
-Clients check `layout` against their own copy of the file, so a payload
-applied to the wrong file is an error rather than a corrupt rig.
+Clients check `layout` against their own copy of the file and reject mismatched
+layouts. This is not a content hash: two different files with the same layout
+can pass the check. Apply a payload only to the asset used for its request.
 
 ### Troubleshooting
 
-- **Server fails to start**: Make sure `http_proxy` / `https_proxy` environment variables are unset or correctly configured.
+- **Missing checkpoints/config**: Run `python download.py --model` before local inference or a Docker build. Check path overrides if models are stored elsewhere.
+- **Docker base image unavailable**: Provide the default `torch-runtime:2.11.0-cu128-py3.11` image or set `SKINTOKENS_BASE_IMAGE` to a compatible Linux image with PyTorch, CUDA and Triton installed.
+- **Client rejected / still loading**: Check `/health` and server logs. Compose limits uploads to 32 MiB and samples to 4 by default; standalone defaults are 64 MiB and 1 sample. Geometry limits are configured by `SKINTOKENS_INPUT_*` (see [`limits.py`](src/rig_package/glb_io/limits.py)).
+- **External glTF buffers rejected**: Embed buffers or convert the asset to a self-contained GLB before sending it to the service.
+- **Need materials/textures in the output**: Use `skintokens_client.py` with the default `--output-format rig`. Local `demo.py` and server `output=glb` export only the skinned mesh.
 
 ## 🙏 Acknowledgements
 
