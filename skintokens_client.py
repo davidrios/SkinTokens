@@ -2,7 +2,7 @@
 
 Example:
     python skintokens_client.py --input assets/character.glb --output out.glb
-    python skintokens_client.py --input model.glb --server http://HOST:8087
+    python skintokens_client.py --input model.glb --server 127.0.0.1:8087
 
 By default the server sends a rig payload (skeleton and skin only, several
 times smaller than a GLB) and this client adds it to the input file: the output
@@ -310,7 +310,8 @@ def main() -> None:
         default=None,
         help="Output GLB path (default: outputs/<input_name>_skined.glb)",
     )
-    parser.add_argument("--server", default="http://localhost:8087", help="Server base URL")
+    parser.add_argument("--server", default="127.0.0.1:8087", metavar="HOST:PORT",
+                        help="Server IP or hostname and port (default: 127.0.0.1:8087)")
 
     parser.add_argument("--num-samples", type=int, default=1,
                         help="Rigs to generate, each from a different point sampling of the mesh "

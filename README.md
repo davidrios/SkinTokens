@@ -112,7 +112,7 @@ python serve.py
 The server listens on port 8087 by default. `GET /health` reports readiness and supported output formats; `WS /ws/generate` accepts generation requests. There is no browser UI or REST generation endpoint. After the model finishes loading, run the client in another terminal:
 
 ```sh
-python skintokens_client.py --server http://127.0.0.1:8087 --input examples/giraffe.glb --output results/giraffe.glb
+python skintokens_client.py --server 127.0.0.1:8087 --input examples/giraffe.glb --output results/giraffe.glb
 ```
 
 The client needs `websockets` (included via `uvicorn[standard]`), NumPy, SciPy and this repository's `src` package, but no PyTorch or GPU on the client machine. By default it requests a compact rig payload and adds the rig to the original asset, preserving materials and textures. For GLB inputs it uploads a reduced geometry-only representation; the original file stays on the client for reconstruction.
@@ -154,7 +154,7 @@ The image is based on `torch-runtime:2.11.0-cu128-py3.11` (PyTorch 2.11 + CUDA
 Check `http://127.0.0.1:8087/health`, then run the client on the host:
 
 ```powershell
-python skintokens_client.py --server http://127.0.0.1:8087 `
+python skintokens_client.py --server 127.0.0.1:8087 `
   --input examples/giraffe.glb --output results/giraffe.glb
 ```
 
