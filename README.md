@@ -109,7 +109,9 @@ The upstream [Hugging Face Space](https://huggingface.co/spaces/VAST-AI/SkinToke
 python serve.py
 ```
 
-The server listens on port 8087 by default. `GET /health` reports readiness and supported output formats; `WS /ws/generate` accepts generation requests. There is no browser UI or REST generation endpoint. After the model finishes loading, run the client in another terminal:
+The server listens on port 8087 by default. `GET /health` reports readiness and supported output formats and allows cross-origin browser reads (CORS, without credentials); `WS /ws/generate` accepts generation requests. There is no browser UI or REST generation endpoint. After the model finishes loading, run the client in another terminal:
+
+Health `status` is `"ok"` while requests can be admitted and `"busy"` when `admitted >= max_admitted` (both HTTP 200). It returns `"loading"` with HTTP 503 while the worker pools are unavailable. The separate `busy` boolean indicates active generation work, even when there is still queue capacity.
 
 ```sh
 python skintokens_client.py --server 127.0.0.1:8087 --input examples/giraffe.glb --output results/giraffe.glb

@@ -74,6 +74,7 @@ configure_logging()
 logger = logging.getLogger("skintokens.serve")
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from src.server import config
@@ -415,6 +416,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="SkinTokens / TokenRig Inference Server", version="1.0",
               lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
@@ -423,12 +430,13 @@ async def health():
         return JSONResponse({"status": "loading"}, status_code=503)
     pool = state.pool.status()
     cpu_pool = state.cpu_pool.status()
+    max_admitted = _admission_limit()
     return {
-        "status": "ok",
+        "status": "busy" if state.admitted >= max_admitted else "ok",
         "busy": state.busy,
         "active_jobs": state.active_jobs,
         "admitted": state.admitted,
-        "max_admitted": _admission_limit(),
+        "max_admitted": max_admitted,
         "workers": pool["workers"],
         "cpu_workers": cpu_pool["workers"],
         "pool": pool,
