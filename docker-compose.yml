@@ -67,6 +67,16 @@ services:
     ports:
       - "8087:8000"
     shm_size: 1gb
+    # No swap for this container (memswap_limit == mem_limit sets the cgroup's
+    # memory.swap.max to 0). Docker Desktop's WSL2 VM with
+    # autoMemoryReclaim=gradual proactively reclaims idle memory, and with swap
+    # available that pushes the idle workers' anonymous memory (Python heaps,
+    # torch/CUDA host state) out to swap; the first requests after a few idle
+    # minutes then page it all back in and take 4-10s instead of ~1s. Without
+    # swap only page cache can be reclaimed here. The limit itself is generous
+    # (the workers' resident memory is ~1 GB plus uploads in flight).
+    mem_limit: ${SKINTOKENS_MEM_LIMIT:-32g}
+    memswap_limit: ${SKINTOKENS_MEM_LIMIT:-32g}
     command: ["python", "-m", "src.server.log_archive", "python", "serve.py"]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
