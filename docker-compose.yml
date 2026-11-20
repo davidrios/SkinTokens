@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        BASE_IMAGE: ${SKINTOKENS_BASE_IMAGE:-torch-runtime:2.11.0-cu128-py3.11}
+        BASE_IMAGE: ${SKINTOKENS_BASE_IMAGE:-pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime}
     image: skintokens:cu128-torch2.11.0
     container_name: skintokens
     restart: unless-stopped

@@ -1,14 +1,10 @@
 # Allowlist: exclude everything, then re-include runtime files only.
+# Model weights are downloaded inside the build (see Dockerfile "weights" stage).
 *
 !serve.py
 !requirements.txt
 !configs/**
 !src/**
-# Model weights (checkpoints + Qwen3 tokenizer/config; no HF cache metadata)
-!experiments/**/*.ckpt
-!models/Qwen3-0.6B/*.json
-!models/Qwen3-0.6B/merges.txt
-!models/Qwen3-0.6B/LICENSE
 **/__pycache__
 **/*.py[cod]
 **/.cache

@@ -135,11 +135,10 @@ Inputs may be `.glb` or `.gltf`. Local CLI input can reference adjacent resource
 
 ### Docker (NVIDIA GPU)
 
-The image is self-contained: the `Dockerfile` copies the project source and the
-model checkpoints (`experiments/`, `models/`) into the image at build time.
-Run `python download.py --model` on the host before building. The default base
-image, `torch-runtime:2.11.0-cu128-py3.11`, must also be available locally or
-from your registry; this repository does not build it. The image contains only
+The image is self-contained: the build downloads the model checkpoints
+(`experiments/`, `models/`) from Hugging Face in a separate stage and copies them,
+together with the project source, into the image. Nothing needs to be downloaded
+on the host first. The image contains only
 the service runtime, not `demo.py`, the client or `examples/`. Logs and failure
 dumps live on the `skintokens-outputs` Docker volume; generated results are sent
 to clients and saved by the client.
@@ -150,8 +149,10 @@ docker compose build
 docker compose up -d
 ```
 
-The image is based on `torch-runtime:2.11.0-cu128-py3.11` (PyTorch 2.11 + CUDA
-12.8 + Triton preinstalled). Override it with `$env:SKINTOKENS_BASE_IMAGE`.
+The image is based on the public `pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime`
+(PyTorch 2.11 + CUDA 12.8 + Triton preinstalled). Override it with
+`$env:SKINTOKENS_BASE_IMAGE`. Docker needs NVIDIA GPU support (Docker Desktop with
+the WSL2 backend on Windows, or the NVIDIA Container Toolkit on Linux).
 
 Check `http://127.0.0.1:8087/health`, then run the client on the host:
 
@@ -345,8 +346,8 @@ can pass the check. Apply a payload only to the asset used for its request.
 
 ### Troubleshooting
 
-- **Missing checkpoints/config**: Run `python download.py --model` before local inference or a Docker build. Check path overrides if models are stored elsewhere.
-- **Docker base image unavailable**: Provide the default `torch-runtime:2.11.0-cu128-py3.11` image or set `SKINTOKENS_BASE_IMAGE` to a compatible Linux image with PyTorch, CUDA and Triton installed.
+- **Missing checkpoints/config**: Run `python download.py --model` before local inference (Docker builds download them automatically). Check path overrides if models are stored elsewhere.
+- **Docker base image**: The default is `pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime`; set `SKINTOKENS_BASE_IMAGE` to another Linux image with PyTorch, CUDA and Triton installed if needed.
 - **Client rejected / still loading**: Check `/health` and server logs. Compose limits uploads to 32 MiB and samples to 4 by default; standalone defaults are 64 MiB and 1 sample. Geometry limits are configured by `SKINTOKENS_INPUT_*` (see [`limits.py`](src/rig_package/glb_io/limits.py)).
 - **External glTF buffers rejected**: Embed buffers or convert the asset to a self-contained GLB before sending it to the service.
 - **Need materials/textures in the output**: Use `skintokens_client.py` with the default `--output-format rig`. Local `demo.py` and server `output=glb` export only the skinned mesh.
